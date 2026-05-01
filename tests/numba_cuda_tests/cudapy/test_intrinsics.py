@@ -663,7 +663,12 @@ class TestCudaIntrinsic(NumbaCUDATestCase):
     @pytest.mark.xfail(True, reason="Bitcode parsing error")
     def test_hfma_ptx(self):
         compiled = numba_cuda_mlir.cuda.jit("void(f2[:], f2, f2, f2)", lto=True)(simple_hfma_scalar)
+        args = (f2[:], f2, f2, f2)
+        ptx = compiled.inspect_lto_ptx(args)
+        self.assertIn("fma.rn.f16", ptx)
+
     def test_hsub(self):
+        compiled = numba_cuda_mlir.cuda.jit("void(f2[:], f2[:], f2[:])")(simple_hsub)
         ary = np.zeros(1, dtype=np.float16)
         arg1 = np.array([3.0], dtype=np.float16)
         arg2 = np.array([4.0], dtype=np.float16)
@@ -686,7 +691,13 @@ class TestCudaIntrinsic(NumbaCUDATestCase):
         self.assertIn("sub.f16", ptx)
 
     def test_hmul(self):
+        compiled = numba_cuda_mlir.cuda.jit(simple_hmul)
+        ary = np.zeros(1, dtype=np.float16)
+        arg1 = np.array([3.0], dtype=np.float16)
+        arg2 = np.array([4.0], dtype=np.float16)
+        compiled[1, 1](ary, arg1, arg2)
         np.testing.assert_allclose(ary[0], arg1 * arg2, rtol=self.FLOAT16_RTOL)
+
     def test_hmul_scalar(self):
         compiled = numba_cuda_mlir.cuda.jit("void(f2[:], f2, f2)")(simple_hmul_scalar)
         ary = np.zeros(1, dtype=np.float16)
@@ -1061,7 +1072,13 @@ class TestCudaIntrinsic(NumbaCUDATestCase):
             -3,
             -2,
             -1,
+            0,
+            1,
+            2,
+            3,
+            4,
             5,
+            # The algorithm currently implemented can only round to 13 digits
             # with single precision. Note that this doesn't trigger the
             # "overflow safe" branch of the implementation, which can only be
             # hit when using double precision.
