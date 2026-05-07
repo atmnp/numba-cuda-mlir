@@ -64,12 +64,12 @@ def _decorate_setattr(impl, ty, attr):
     return res
 
 
-class MLIRLoweringRegistry(Registry):
+class LoweringRegistry(Registry):
     """
     Registry for MLIR-based lowering implementations.
 
     Each lowering module should create its own instance of this registry:
-        registry = MLIRLoweringRegistry()
+        registry = LoweringRegistry()
         lower = registry.lower
     """
 

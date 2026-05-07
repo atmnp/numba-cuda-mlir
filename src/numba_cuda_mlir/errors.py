@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from numba_cuda_mlir.numba_cuda.core.errors import ForceLiteralArg, TypingError
 from numba_cuda_mlir._mlir.ir import Operation, Value, Block
-from typeguard import typechecked
 from typing import TypeVar
 import inspect
 from pathlib import Path
@@ -106,7 +105,6 @@ class ExtensionError(Exception):
         super().__init__(prefix + message, *args, **kwargs)
 
 
-@typechecked
 def ensure_verifies(op: T) -> T:
     if not isinstance(op, (Operation, Value, Block)):
         return op

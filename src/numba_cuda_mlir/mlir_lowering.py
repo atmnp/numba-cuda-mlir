@@ -3,7 +3,6 @@
 
 from numba_cuda_mlir.descriptor import MLIRDispatcherType
 from functools import lru_cache
-from typeguard import typechecked
 from io import StringIO
 import logging
 import operator
@@ -58,35 +57,27 @@ from numba_cuda_mlir._mlir.dialects import (
     llvm,
     arith,
     builtin,
-    bufferization,
     cf,
     func,
-    linalg,
     math,
     memref,
     scf,
     nvvm,
     gpu,
-    tensor,
-    shape,
 )
-from numba_cuda_mlir._mlir.dialects import complex as complex_dialect
 
 from numba_cuda_mlir.logging import trace
-from numba_cuda_mlir import mlir_debuginfo, mlir_lowering_registry
+from numba_cuda_mlir import mlir_debuginfo
 from numba_cuda_mlir.tools import (
-    get_gpu_compute_capability,
     generate_mangled_name,
-    parse_compute_capability,
     get_max_ptx_version,
+    resolve_gpu_target,
 )
 from numba_cuda_mlir.linker import Linker
 from numba_cuda_mlir.memory_management.nrt_mlir import emit_nrt_functions
 from numba_cuda_mlir.nrt_context import MLIRNRTContext
 from numba_cuda_mlir.type_defs.aggregate_types import AggregateType, UnionType
 from numba_cuda_mlir.types import Record
-
-DEFAULT_SM_ARCH = get_gpu_compute_capability()
 
 ERROR_CODE_GLOBAL_NAME = "__numba_cuda_mlir_error_code"
 KERNEL_ERROR_CODES = {
@@ -130,29 +121,14 @@ class MLIRLower(object):
         self.metadata = metadata
         self.flags = targetconfig.ConfigStack.top_or_none()
         self.targetoptions = self.metadata["targetoptions"]
-        if "chip" in self.targetoptions:
-            arch = self.targetoptions["chip"]
-            cc = parse_compute_capability(arch)
-            arch_suffix = arch.removeprefix(f"sm_{cc[0]}{cc[1]}")
-            arch_specific_cc = (*cc, arch_suffix) if arch_suffix in ("a", "f") else cc
-        else:
-            cc = get_gpu_compute_capability(tuple)
-            arch = get_gpu_compute_capability(str)
-            arch_specific_cc = cc
-
+        gpu_target = self.metadata.get("gpu_target") or resolve_gpu_target(self.targetoptions)
+        self.metadata["gpu_target"] = gpu_target
+        self.targetoptions["chip"] = gpu_target["chip"]
+        cc = gpu_target["cc"]
         assert isinstance(cc, tuple)
 
-        # The linker cubin arch must be >= the PTX target. For forward-compat
-        # (e.g. sm_75 PTX on sm_100 host), link for the host. Otherwise
-        # preserve the user's arch string (e.g. sm_100a) for the linker.
-        host_cc = get_gpu_compute_capability(tuple)
-        host_arch = get_gpu_compute_capability(str)
-        if cc < host_cc:
-            linker_cc = host_cc
-            linker_arch = host_arch
-        else:
-            linker_cc = arch_specific_cc
-            linker_arch = arch
+        linker_cc = gpu_target["linker_cc"]
+        linker_arch = gpu_target["linker_arch"]
 
         link_files = list(self.targetoptions.get("link", []))
         has_ltoir_files = any(
@@ -182,6 +158,7 @@ class MLIRLower(object):
         self._seen_mlir_libraries = set()
         self._cloned_device_funcs: set[str] = set()
         self._linked_external_items = set()
+        self._linked_external_link_items = []
         self.linker = self._create_linker()
 
         # Collect module callbacks from LinkableCode objects (e.g. CUSource)
@@ -492,7 +469,7 @@ extern "C" __global__ void
         assert self.mlir_module is not None
         with ir.InsertionPoint(self.mlir_module.body) as ip:
             # Derive target attributes from user-provided targetoptions, with sensible defaults
-            chip = 'chip = "' + self.targetoptions.get("chip", DEFAULT_SM_ARCH) + '"'
+            chip = 'chip = "' + self.targetoptions["chip"] + '"'
             opt_level = int(self.targetoptions.get("opt_level", 2))
             flags = []
             if self.targetoptions.get("fastmath", False):
@@ -634,7 +611,6 @@ extern "C" __global__ void
                     self._capi_sym_name
                 )
 
-    @typechecked
     def alloca(self, ty: ir.Type, count: int = 1) -> ir.Value:
         with self.alloca_insertion_point():
             count_value = i64_of(count)
@@ -1170,6 +1146,7 @@ extern "C" __global__ void
                     self.store_var(target, value_op)
 
     def lower_array_literal(self, value: np.ndarray) -> ir.Value:
+        from numba_cuda_mlir._mlir.dialects import tensor
         from numba_cuda_mlir.lowering_utilities import tensor_to_memref
 
         with self.alloca_insertion_point():
@@ -1752,7 +1729,6 @@ extern "C" __global__ void
             result = call_result
         self.store_var(target, result)
 
-    @typechecked
     def get_registered_builder(
         self,
         fn: numba_ir.Var | _Intrinsic | AnyCallable[PS],
@@ -1886,11 +1862,27 @@ extern "C" __global__ void
             return
         self._linked_external_items.add(key)
 
-        if hasattr(link_item, "setup_callback") and link_item.setup_callback:
+        has_setup_callback = hasattr(link_item, "setup_callback") and link_item.setup_callback
+        has_teardown_callback = (
+            hasattr(link_item, "teardown_callback") and link_item.teardown_callback
+        )
+        if (has_setup_callback or has_teardown_callback) and not self.targetoptions.get(
+            "_lto_explicit", False
+        ):
+            self.targetoptions["lto"] = False
+            self.targetoptions["output"] = "ptx"
+            if self._linker_config["lto"]:
+                self._linker_config["lto"] = False
+                self.linker = self._create_linker()
+                for prior_link_item in self._linked_external_link_items:
+                    self.linker.add_file_guess_ext(prior_link_item)
+
+        if has_setup_callback:
             self._setup_callbacks.append(link_item.setup_callback)
-        if hasattr(link_item, "teardown_callback") and link_item.teardown_callback:
+        if has_teardown_callback:
             self._teardown_callbacks.append(link_item.teardown_callback)
         self.linker.add_file_guess_ext(link_item)
+        self._linked_external_link_items.append(link_item)
 
     @staticmethod
     def _external_link_item_key(link_item):
