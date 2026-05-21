@@ -64,6 +64,8 @@ from numba_cuda_mlir._mlir.dialects import (
     scf,
     nvvm,
     gpu,
+    complex as complex_dialect,
+    vector as vector_dialect,
 )
 
 from numba_cuda_mlir.logging import trace
@@ -1213,7 +1215,7 @@ extern "C" __global__ void
 
     def lower_literal_if_needed(self, value: ir.Value | np.ndarray, numba_type=None) -> ir.Value:
         match value:
-            case types.Type() if isinstance(numba_type, types.NumberClass):
+            case types.Type() if isinstance(numba_type, types.DTypeSpec):
                 return self._materialize_type_token(numba_type)
             case tuple():
                 return tuple(map(self.lower_literal_if_needed, value))
@@ -1884,6 +1886,10 @@ extern "C" __global__ void
         ty = self.get_numba_type(var.name)
         if isinstance(ty, types.NumberClass):
             return types.NumberClass
+        from numba_cuda_mlir.typing.cuda_vector_types import VectorTypeClass
+
+        if isinstance(ty, VectorTypeClass):
+            return ty.instance_type
         if isinstance(ty, types.Function):
             if self.var_lowered(var):
                 fn = self.load_var(var)
@@ -2369,7 +2375,7 @@ extern "C" __global__ void
         return tuple(result)
 
     def _materialize_type_token(self, target_type):
-        if isinstance(target_type, types.NumberClass):
+        if isinstance(target_type, types.DTypeSpec):
             return self._zero_value_for_type(self.get_mlir_type(target_type.dtype))
         raise InternalCompilerError(f"Cannot materialize type token for {target_type}.")
 
@@ -2379,10 +2385,11 @@ extern "C" __global__ void
         if isinstance(mlir_type, (ir.FloatType, ir.F16Type, ir.BF16Type)):
             return arith.constant(result=mlir_type, value=0.0)
         if isinstance(mlir_type, ir.ComplexType):
-            from numba_cuda_mlir._mlir.dialects import complex as complex_dialect
-
             zero = self._zero_value_for_type(mlir_type.element_type)
             return complex_dialect.create_(complex=mlir_type, real=zero, imaginary=zero)
+        if isinstance(mlir_type, ir.VectorType):
+            zero = self._zero_value_for_type(mlir_type.element_type)
+            return vector_dialect.broadcast(mlir_type, zero)
         if str(mlir_type).startswith("!llvm."):
             return llvm.mlir_undef(res=mlir_type)
         raise InternalCompilerError(f"Cannot materialize zero value for {mlir_type}.")
@@ -2915,7 +2922,7 @@ extern "C" __global__ void
             return_ctor([])
         else:
             value = self.load_var(value)
-            if isinstance(value_type, types.NumberClass) and isinstance(value, types.Type):
+            if isinstance(value_type, types.DTypeSpec) and isinstance(value, types.Type):
                 value = self._materialize_type_token(value_type)
             if isinstance(value, tuple):
                 return_ctor(list(value))
