@@ -16,7 +16,8 @@ from numba_cuda_mlir.numba_cuda.core import analysis
 from numba_cuda_mlir.numba_cuda.extending import _Intrinsic
 
 from numba_cuda_mlir.numba_cuda.core.environment import Environment
-from numba_cuda_mlir.numba_cuda import types
+from numba_cuda_mlir import types
+from numba_cuda_mlir.numba_cuda import types as numba_types
 from numba_cuda_mlir.numba_cuda.datamodel.models import ArrayModel
 from numba_cuda_mlir.annotations import Builder, AnyCallable, PS
 from numba_cuda_mlir.errors import InternalCompilerError, ensure_verifies
@@ -270,7 +271,7 @@ class MLIRLower(object):
                 continue
             # UnionType is used here as a DI/tag container only;
             # the lowered value is stored in a shared canonical slot.
-            poly_types[name] = types.UnionType(type_set)
+            poly_types[name] = numba_types.UnionType(type_set)
         return poly_types
 
     @staticmethod
@@ -1886,9 +1887,8 @@ extern "C" __global__ void
         ty = self.get_numba_type(var.name)
         if isinstance(ty, types.NumberClass):
             return types.NumberClass
-        from numba_cuda_mlir.typing.cuda_vector_types import VectorTypeClass
 
-        if isinstance(ty, VectorTypeClass):
+        if isinstance(ty, types.VectorTypeClass):
             return ty.instance_type
         if isinstance(ty, types.Function):
             if self.var_lowered(var):
@@ -3366,11 +3366,11 @@ extern "C" __global__ void
             case types.CharSeq():
                 return ir.Type.parse(f"!llvm.array<{ty.count} x i8>")
             case types.UnicodeCharSeq():
-                import numpy as np
-
                 char_bits = np.dtype("U1").itemsize * 8
                 return ir.Type.parse(f"!llvm.array<{ty.count} x i{char_bits}>")
             case _:
+                if isinstance(ty, types.DTypeSpec):
+                    return self.get_mlir_type(ty.dtype)
                 try:
                     return self.context.get_value_type(ty)
                 except KeyError as e:
