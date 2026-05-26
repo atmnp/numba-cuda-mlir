@@ -61,7 +61,7 @@ def test_incomplete_slice(shape, answer):
     # CHECK-SAME: (%[[ARG:.+]]: memref
     # CHECK-SAME: kernel
     # CHECK: scf.forall
-    # CHECK-NEXT: memref.store %{{.+}}, %[[ARG]]
+    # CHECK: memref.store %{{.+}}, %[[ARG]]
 
     cres = compiler.compile_for(k, d)
     mlir = cres.mlir_module_str

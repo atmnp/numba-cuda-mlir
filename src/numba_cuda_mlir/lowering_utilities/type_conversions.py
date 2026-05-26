@@ -192,6 +192,32 @@ def to_mlir_type(obj):
     raise TypeError(f"No conversion found for type {type(obj)}")
 
 
+def to_mlir_storage_type(obj):
+    from numba_cuda_mlir.models import mlir_data_manager
+
+    if isinstance(obj, types.Type):
+        return mlir_data_manager.lookup(obj).get_data_type()
+    if isinstance(obj, np.dtype):
+        return mlir_data_manager.lookup(to_numba_type(obj)).get_data_type()
+    return to_mlir_type(obj)
+
+
+def to_mlir_argument_type(obj):
+    from numba_cuda_mlir.models import mlir_data_manager
+
+    if isinstance(obj, types.Type):
+        return mlir_data_manager.lookup(obj).get_argument_type()
+    return to_mlir_type(obj)
+
+
+def to_mlir_return_type(obj):
+    from numba_cuda_mlir.models import mlir_data_manager
+
+    if isinstance(obj, types.Type):
+        return mlir_data_manager.lookup(obj).get_return_type()
+    return to_mlir_type(obj)
+
+
 @to_mlir_type.register(ir.Value)
 def _(val: ir.Value) -> ir.Type:
     """Extract the MLIR type from an MLIR Value (including ScalarValue)."""
@@ -364,7 +390,9 @@ def _(ty: types.Type) -> ir.Type:
             # is not a valid memref element type
             if isinstance(ty.dtype, Record):
                 return ir.MemRefType.get([dyn] * ty.ndim, T.i8(), layout=layout)
-            dtype = to_mlir_type(ty.dtype)
+            from numba_cuda_mlir.models import mlir_data_manager
+
+            dtype = mlir_data_manager.lookup(ty.dtype).get_data_type()
             return ir.MemRefType.get([dyn] * ty.ndim, dtype, layout=layout)
         case types.AggregateType():
             st = llvm.StructType.get_identified(ty.name)
@@ -456,6 +484,14 @@ def np_dtype_to_numba_dtype(dtype: np.dtype) -> types.Type:
             return types.int32
         case np.int64:
             return types.int64
+        case np.uint8:
+            return types.uint8
+        case np.uint16:
+            return types.uint16
+        case np.uint32:
+            return types.uint32
+        case np.uint64:
+            return types.uint64
         case np.complex64:
             return types.complex64
         case np.complex128:

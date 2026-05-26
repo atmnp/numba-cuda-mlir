@@ -11,7 +11,7 @@ import os
 import numpy as np
 
 from .cudadrv import devicearray, devices, driver
-from numba_cuda_mlir.numba_cuda.core import config
+from numba_cuda_mlir.numba_cuda.core import config, errors
 from numba_cuda_mlir.numba_cuda.api_util import prepare_shape_strides_dtype
 
 # NDarray device helper
@@ -19,6 +19,22 @@ from numba_cuda_mlir.numba_cuda.api_util import prepare_shape_strides_dtype
 require_context = devices.require_context
 current_context = devices.get_context
 gpus = devices.gpus
+
+
+def _dtype_from_cuda_array_interface(desc, owner):
+    dtype = np.dtype(desc["typestr"])
+    if dtype.char == "V" and owner is not None and hasattr(owner, "dtype"):
+        owner_dtype = np.dtype(owner.dtype)
+        if owner_dtype.itemsize == dtype.itemsize:
+            from numba_cuda_mlir.numba_cuda.np import numpy_support
+
+            try:
+                numpy_support.from_dtype(owner_dtype)
+            except errors.NumbaError:
+                pass
+            else:
+                return owner_dtype
+    return dtype
 
 
 @require_context
@@ -40,8 +56,9 @@ def from_cuda_array_interface(desc, owner=None, sync=True):
 
     shape = desc["shape"]
     strides = desc.get("strides")
+    dtype = _dtype_from_cuda_array_interface(desc, owner)
 
-    shape, strides, dtype = prepare_shape_strides_dtype(shape, strides, desc["typestr"], order="C")
+    shape, strides, dtype = prepare_shape_strides_dtype(shape, strides, dtype, order="C")
     size = driver.memory_size_from_info(shape, strides, dtype.itemsize)
 
     cudevptr_class = driver.binding.CUdeviceptr
