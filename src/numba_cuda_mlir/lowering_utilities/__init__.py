@@ -27,6 +27,8 @@ from numba_cuda_mlir._mlir.dialects import (
     llvm,
     cf,
     builtin,
+    complex as complex_dialect,
+    vector as vector_dialect,
 )
 from numba_cuda_mlir.mlir.dialect_exts import scf
 from numba_cuda_mlir._mlir.extras.meta import region_op
@@ -1223,6 +1225,22 @@ class IterResult:
         self.is_valid = is_valid
 
 
+def _zero_value_for_type(mlir_type):
+    if isinstance(mlir_type, (ir.IntegerType, ir.IndexType)):
+        return arith.constant(result=mlir_type, value=0)
+    if isinstance(mlir_type, ir.FloatType):
+        return arith.constant(result=mlir_type, value=0.0)
+    if isinstance(mlir_type, ir.ComplexType):
+        zero = _zero_value_for_type(mlir_type.element_type)
+        return complex_dialect.create_(complex=mlir_type, real=zero, imaginary=zero)
+    if isinstance(mlir_type, ir.VectorType):
+        zero = _zero_value_for_type(mlir_type.element_type)
+        return vector_dialect.broadcast(mlir_type, zero)
+    if str(mlir_type).startswith("!llvm."):
+        return llvm.mlir_zero(res=mlir_type)
+    raise InternalCompilerError(f"Cannot materialize iterator dummy value for {mlir_type}.")
+
+
 @dataclass
 class UniTupleIterObject:
     """
@@ -1267,19 +1285,25 @@ class UniTupleIterObject:
         current_index = self.index
         is_valid = arith.cmpi(predicate=arith.CmpIPredicate.slt, lhs=current_index, rhs=count)
 
-        if self._uses_llvm:
-            elem_ptr = llvm.getelementptr(
-                llvm.PointerType.get(),
-                self._tuple_storage,
-                [current_index],
-                [GEP_DYNAMIC_INDEX],
-                self._element_type,
-                None,
-            )
-            current_value = llvm.load(res=self._element_type, addr=elem_ptr)
-        else:
-            index_as_index = arith.index_cast(out=ir.IndexType.get(), in_=current_index)
-            current_value = memref.load(self._tuple_storage, [index_as_index])
+        load_if_valid = scf.IfOp(is_valid, results_=[self._element_type], has_else=True)
+        with ir.InsertionPoint(load_if_valid.then_block):
+            if self._uses_llvm:
+                elem_ptr = llvm.getelementptr(
+                    llvm.PointerType.get(),
+                    self._tuple_storage,
+                    [current_index],
+                    [GEP_DYNAMIC_INDEX],
+                    self._element_type,
+                    None,
+                )
+                current_value = llvm.load(res=self._element_type, addr=elem_ptr)
+            else:
+                index_as_index = arith.index_cast(out=ir.IndexType.get(), in_=current_index)
+                current_value = memref.load(self._tuple_storage, [index_as_index])
+            scf.yield_([current_value])
+        with ir.InsertionPoint(load_if_valid.else_block):
+            scf.yield_([_zero_value_for_type(self._element_type)])
+        current_value = load_if_valid.results[0]
 
         next_index = arith.addi(lhs=current_index, rhs=one)
         updated_index = arith.select(
@@ -1324,8 +1348,15 @@ class ArrayIterObject:
         length = self.length
 
         is_valid = arith.cmpi(predicate=arith.CmpIPredicate.slt, lhs=current_index, rhs=length)
-        index_as_index = arith.index_cast(out=ir.IndexType.get(), in_=current_index)
-        current_value = memref.load(self._array, [index_as_index])
+
+        load_if_valid = scf.IfOp(is_valid, results_=[self._element_type], has_else=True)
+        with ir.InsertionPoint(load_if_valid.then_block):
+            index_as_index = arith.index_cast(out=ir.IndexType.get(), in_=current_index)
+            current_value = memref.load(self._array, [index_as_index])
+            scf.yield_([current_value])
+        with ir.InsertionPoint(load_if_valid.else_block):
+            scf.yield_([_zero_value_for_type(self._element_type)])
+        current_value = load_if_valid.results[0]
 
         next_index = arith.addi(lhs=current_index, rhs=one)
         updated_index = arith.select(
