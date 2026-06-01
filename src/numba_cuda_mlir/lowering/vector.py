@@ -91,7 +91,9 @@ def _scalar_storage_vector_type(lower: MLIRLower, vec_numba_type: VectorType) ->
     return _vector_with_element_type(value_vec_type, lower.get_storage_type(vec_numba_type.dtype))
 
 
-def _storage_vector_to_value(vec_numba_type: VectorType, value: ir.Value, value_vec_type: ir.VectorType):
+def _storage_vector_to_value(
+    vec_numba_type: VectorType, value: ir.Value, value_vec_type: ir.VectorType
+):
     if value.type == value_vec_type:
         return value
 
@@ -121,7 +123,9 @@ def _storage_vector_to_value(vec_numba_type: VectorType, value: ir.Value, value_
     return convert(value, value_vec_type)
 
 
-def _value_vector_to_storage(vec_numba_type: VectorType, value: ir.Value, storage_vec_type: ir.VectorType):
+def _value_vector_to_storage(
+    vec_numba_type: VectorType, value: ir.Value, storage_vec_type: ir.VectorType
+):
     if value.type == storage_vec_type:
         return value
 
@@ -138,7 +142,11 @@ def _value_vector_to_storage(vec_numba_type: VectorType, value: ir.Value, storag
         bits = arith.bitcast(out=bits_type, in_=value)
         bits_elem_type = ir.VectorType(bits_type).element_type
         if bits_elem_type.width == storage_elem_type.width:
-            return bits if bits_type == storage_vec_type else arith.bitcast(out=storage_vec_type, in_=bits)
+            return (
+                bits
+                if bits_type == storage_vec_type
+                else arith.bitcast(out=storage_vec_type, in_=bits)
+            )
         if bits_elem_type.width < storage_elem_type.width:
             return arith.extui(out=storage_vec_type, in_=bits)
         return arith.trunci(out=storage_vec_type, in_=bits)

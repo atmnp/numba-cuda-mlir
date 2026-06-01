@@ -1505,7 +1505,9 @@ def lower_array_tuple_getitem(builder: MLIRLower, target, args, kwargs):
             )
             builder.store_var(target, value)
         case types.Number() | types.Boolean():
-            value = lowering_utilities.array_element_value_load(array_numba_type, array, full_offsets)
+            value = lowering_utilities.array_element_value_load(
+                array_numba_type, array, full_offsets
+            )
             builder.store_var(target, value)
         case _:
             raise InternalCompilerError(
@@ -2388,7 +2390,9 @@ def np_zeros_lower(builder, target, args, kwargs):
     zero = _bool_storage_literal(builder, target_type, 0)
     if zero is None:
         element_type = builder.get_value_type(target_type.dtype)
-        zero = arith.constant(result=element_type, value=_zero_literal_for_numba_type(target_type.dtype))
+        zero = arith.constant(
+            result=element_type, value=_zero_literal_for_numba_type(target_type.dtype)
+        )
         zero = builder.as_storage(target_type.dtype, zero)
 
     array_tensor = memref_to_tensor(array_memref)
@@ -2411,7 +2415,9 @@ def np_ones_lower(builder, target, args, kwargs):
     one = _bool_storage_literal(builder, target_type, 1)
     if one is None:
         element_type = builder.get_value_type(target_type.dtype)
-        one = arith.constant(result=element_type, value=_one_literal_for_numba_type(target_type.dtype))
+        one = arith.constant(
+            result=element_type, value=_one_literal_for_numba_type(target_type.dtype)
+        )
         one = builder.as_storage(target_type.dtype, one)
 
     array_tensor = memref_to_tensor(array_memref)

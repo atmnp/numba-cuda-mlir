@@ -1235,7 +1235,10 @@ extern "C" __global__ void
             dtype_numba = to_numba_type(value.dtype)
             dtype = self.get_storage_type(dtype_numba)
             raveled = value.ravel()
-            elems = [self.as_storage(dtype_numba, self.lower_literal_if_needed(e, dtype_numba)) for e in raveled]
+            elems = [
+                self.as_storage(dtype_numba, self.lower_literal_if_needed(e, dtype_numba))
+                for e in raveled
+            ]
             mr_type = T.tensor(*value.shape, element_type=dtype)
             mr = tensor.from_elements(mr_type, elems)
             mr = tensor_to_memref(mr)
@@ -1676,9 +1679,7 @@ extern "C" __global__ void
             func.call(
                 result=callee_function_type,
                 callee=callee.name.value,
-                operands_=self._call_operands_from_vars(
-                    call_vars, expected_types=call_argtypes
-                ),
+                operands_=self._call_operands_from_vars(call_vars, expected_types=call_argtypes),
             )
         )
 
@@ -2100,7 +2101,9 @@ extern "C" __global__ void
 
     def _lower_call_external_numba_abi(self, target, fn_value: ExternFunction, args):
         external_abi_signature = user_signature_to_external_abi_signature(fn_value.sig)
-        external_abi_mlir_type = self._external_abi_function_type(external_abi_signature, numba_abi=True)
+        external_abi_mlir_type = self._external_abi_function_type(
+            external_abi_signature, numba_abi=True
+        )
         return_type = external_abi_mlir_type.results
         user_return_actual_type = fn_value.sig.return_type
 
@@ -2111,7 +2114,9 @@ extern "C" __global__ void
             return_mlir_type = T.i8()
         c1 = arith.constant(result=T.i32(), value=1)
         return_ptr = llvm.alloca(res=ptr, array_size=c1, elem_type=return_mlir_type)
-        operands = [return_ptr] + self._call_operands_from_vars(args, expected_types=fn_value.sig.args)
+        operands = [return_ptr] + self._call_operands_from_vars(
+            args, expected_types=fn_value.sig.args
+        )
 
         callee = get_or_insert_function(fn_value.name, external_abi_mlir_type, self.mlir_gpu_module)
         func.call(result=return_type, callee=callee.name.value, operands_=operands)
@@ -3246,7 +3251,9 @@ extern "C" __global__ void
             # BaseTuple multi-assign uses per-element stack slots.
             if isinstance(var_type, types.UniTuple) and not isinstance(slot, tuple):
                 return tuple(
-                    self.from_storage(var_type.dtype, memref.load(memref=slot, indices=[index_of(i)]))
+                    self.from_storage(
+                        var_type.dtype, memref.load(memref=slot, indices=[index_of(i)])
+                    )
                     for i in range(var_type.count)
                 )
 
@@ -3474,7 +3481,10 @@ extern "C" __global__ void
 
     def _unflatten_abi_value(self, numba_type, values_iter):
         if isinstance(numba_type, types.UniTuple):
-            return tuple(self._unflatten_abi_value(numba_type.dtype, values_iter) for _ in range(numba_type.count))
+            return tuple(
+                self._unflatten_abi_value(numba_type.dtype, values_iter)
+                for _ in range(numba_type.count)
+            )
         if isinstance(numba_type, types.BaseTuple):
             return tuple(self._unflatten_abi_value(t, values_iter) for t in numba_type.types)
         return next(values_iter)
@@ -3483,7 +3493,9 @@ extern "C" __global__ void
         if isinstance(numba_type, types.UniTuple):
             return tuple(self._coerce_value_to_numba_type(numba_type.dtype, v) for v in value)
         if isinstance(numba_type, types.BaseTuple):
-            return tuple(self._coerce_value_to_numba_type(t, v) for t, v in zip(numba_type.types, value))
+            return tuple(
+                self._coerce_value_to_numba_type(t, v) for t, v in zip(numba_type.types, value)
+            )
         if isinstance(value, ir.Value):
             return self.mlir_convert(value, self.get_value_type(numba_type))
         return value
@@ -3492,11 +3504,17 @@ extern "C" __global__ void
         operands = []
         expected_iter = iter(expected_types) if expected_types is not None else None
         for arg in args:
-            arg_type = next(expected_iter) if expected_iter is not None else self.get_numba_type(arg.name)
+            arg_type = (
+                next(expected_iter) if expected_iter is not None else self.get_numba_type(arg.name)
+            )
             value = self._coerce_value_to_numba_type(arg_type, self.load_var(arg))
             operands.extend(self._flatten_abi_value(self.as_argument(arg_type, value)))
         for _, value_var in kws:
-            value_type = next(expected_iter) if expected_iter is not None else self.get_numba_type(value_var.name)
+            value_type = (
+                next(expected_iter)
+                if expected_iter is not None
+                else self.get_numba_type(value_var.name)
+            )
             value = self._coerce_value_to_numba_type(value_type, self.load_var(value_var))
             operands.extend(self._flatten_abi_value(self.as_argument(value_type, value)))
         return operands

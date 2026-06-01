@@ -200,9 +200,7 @@ class DeferredFFIFromBuffer(DeferredLowering):
                 element_type=mr_type.element_type,
                 layout=mr_type.layout,
             )
-            array_value = memref.memory_space_cast(
-                dest=generic_mr_type, source=array_value
-            )
+            array_value = memref.memory_space_cast(dest=generic_mr_type, source=array_value)
             mr_type = ir.MemRefType(array_value.type)
 
         ptr_as_index = memref.extract_aligned_pointer_as_index(array_value)

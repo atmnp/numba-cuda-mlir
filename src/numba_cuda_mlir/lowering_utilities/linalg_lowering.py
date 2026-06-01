@@ -74,6 +74,7 @@ def lower_matmul(mlir_lower, target, target_type, args):
 
     mlir_lower.store_var(target, value_tensor_to_storage_memref(target_type, matmul_result))
 
+
 def get_array_dims(mlir_lower, arg, arg_type):
     if isinstance(arg_type, types.Array):
         dims = []
@@ -298,6 +299,7 @@ def lower_np_binop(mlir_lower, target, target_type, args, linalg_op):
 
     mlir_lower.store_var(target, value_tensor_to_storage_memref(target_type, result_tensor))
 
+
 def lower_transpose(mlir_lower, target, array):
     input_array = mlir_lower.load_var(array)
     input_type = mlir_lower.get_numba_type(array.name)
@@ -385,7 +387,10 @@ def lower_linalg_scalar_array_dot(mlir_lower, target, target_type, args):
     def generate_scalar_array_dot(i1: index_type):
         return mul(scalar_value, tensor.extract(array_tensor, [i1]))
 
-    mlir_lower.store_var(target, value_tensor_to_storage_memref(target_type, generate_scalar_array_dot))
+    mlir_lower.store_var(
+        target, value_tensor_to_storage_memref(target_type, generate_scalar_array_dot)
+    )
+
 
 def lower_linalg_nd_1d_dot(mlir_lower, target, target_type, args):
     lhs_type = mlir_lower.get_numba_type(args[0].name)
