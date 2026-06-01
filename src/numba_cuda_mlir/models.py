@@ -849,22 +849,19 @@ def register_fp8_models():
     )
 
     @register_model(type(_type_fp8_e5m2))
-    class FP8E5M2Model(PrimitiveModel):
+    class FP8E5M2Model(StoragePrimitiveModel):
         def __init__(self, dmm, fe_type):
-            be_type = T.f8E5M2()
-            super().__init__(dmm, fe_type, be_type)
+            super().__init__(dmm, fe_type, T.f8E5M2(), T.i8())
 
     @register_model(type(_type_fp8_e4m3))
-    class FP8E4M3Model(PrimitiveModel):
+    class FP8E4M3Model(StoragePrimitiveModel):
         def __init__(self, dmm, fe_type):
-            be_type = T.f8E4M3FN()
-            super().__init__(dmm, fe_type, be_type)
+            super().__init__(dmm, fe_type, T.f8E4M3FN(), T.i8())
 
     @register_model(type(_type_fp8_e8m0))
-    class FP8E8M0Model(PrimitiveModel):
+    class FP8E8M0Model(StoragePrimitiveModel):
         def __init__(self, dmm, fe_type):
-            be_type = T.f8E8M0FNU()
-            super().__init__(dmm, fe_type, be_type)
+            super().__init__(dmm, fe_type, T.f8E8M0FNU(), T.i8())
 
     @register_model(bfloat16_raw_class)
     class Bfloat16RawModel(PrimitiveModel):

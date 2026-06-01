@@ -713,7 +713,7 @@ extern "C" __global__ void
                 for elem_type in self._tuple_element_types(var_type)
             )
 
-        mlir_type = self.get_mlir_type(var_type)
+        mlir_type = self.get_storage_type(var_type)
         if not _is_valid_memref_element_type(mlir_type):
             return self.alloca(mlir_type, count=1)
 
@@ -1871,10 +1871,12 @@ extern "C" __global__ void
         )
 
         target_type = self.get_numba_type(target.name)
-        if isinstance(target_type, types.BaseTuple):
-            result = tuple(call_result)
+        if len(callee_type.results) == 0:
+            result = ir.NoneType.get()
+        elif isinstance(target_type, types.BaseTuple):
+            result = self.from_return(target_type, tuple(call_result))
         else:
-            result = call_result
+            result = self.from_return(target_type, call_result)
         self.store_var(target, result)
 
     def get_registered_builder(

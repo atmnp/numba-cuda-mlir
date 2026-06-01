@@ -364,6 +364,8 @@ def lower_broadcasted_floor_division(builder, target, args, kwargs):
         rhs = memref_to_value_tensor(rhs_type, rhs)
 
     lhs, rhs = broadcast_shapes_for_binary_op(lhs, rhs, builder)
+    lhs = expensive_coerce_tensor_type(lhs, compute_type)
+    rhs = expensive_coerce_tensor_type(rhs, compute_type)
     sh = shape.shape_of(lhs)
     dims = [shape.get_extent(sh, index_of(i)) for i in range(lhs.type.rank)]
     result_type = T.tensor(*lhs.type.shape, result_value_type)

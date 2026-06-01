@@ -3,7 +3,7 @@
 
 import numpy as np
 
-from numba_cuda_mlir import cuda
+from numba_cuda_mlir import cuda, extending
 
 
 def test_float16_array_constructors_use_storage_values():
@@ -59,3 +59,41 @@ def test_bool_reductions_read_value_elements():
     flags_out = np.zeros(2, dtype=np.int32)
     kernel[1, 1](flags_out, values)
     np.testing.assert_array_equal(flags_out, np.array([1, 0], dtype=np.int32))
+
+
+def test_heterogeneous_tuple_reassignment_uses_storage_slots():
+    @cuda.jit
+    def kernel(out, values, flags):
+        pair = (values[0], flags[0] > 0)
+        if flags[1] > 0:
+            pair = (values[1], flags[2] > 0)
+        out[0] = pair[0]
+        out[1] = 1 if pair[1] else 0
+
+    values = np.array([1.5, 2.5], dtype=np.float16)
+    flags = np.array([1, 1, 0], dtype=np.int32)
+    out = np.zeros(2, dtype=np.float16)
+    kernel[1, 1](out, values, flags)
+    np.testing.assert_allclose(out, np.array([2.5, 0.0], dtype=np.float16))
+
+
+def test_overload_call_converts_storage_return_to_value():
+    def is_positive(x):
+        raise NotImplementedError
+
+    @extending.overload(is_positive, typing_registry=extending.typing_registry)
+    def ol_is_positive(x):
+        def impl(x):
+            return x > np.float16(0)
+
+        return impl
+
+    @cuda.jit
+    def kernel(out, values):
+        out[0] = 1 if is_positive(values[0]) else 0
+        out[1] = 1 if is_positive(values[1]) else 0
+
+    values = np.array([1.0, -1.0], dtype=np.float16)
+    out = np.zeros(2, dtype=np.int32)
+    kernel[1, 1](out, values)
+    np.testing.assert_array_equal(out, np.array([1, 0], dtype=np.int32))

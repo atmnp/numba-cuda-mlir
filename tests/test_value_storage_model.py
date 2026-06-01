@@ -5,7 +5,7 @@ import numpy as np
 
 from numba_cuda_mlir._mlir import ir
 from numba_cuda_mlir import types
-from numba_cuda_mlir.models import mlir_data_manager
+from numba_cuda_mlir.models import mlir_data_manager, register_fp8_models
 from numba_cuda_mlir.numba_cuda.types.ext_types import bfloat16
 from numba_cuda_mlir.numba_cuda.np import numpy_support
 
@@ -17,6 +17,7 @@ def _model_pair(numba_type):
 
 def test_scalar_value_and_storage_types_are_distinct_where_required():
     with ir.Context(), ir.Location.unknown():
+        register_fp8_models()
         assert _model_pair(types.bool) == ("i1", "i8")
         assert _model_pair(types.float16) == ("f16", "i16")
         assert _model_pair(bfloat16) == ("bf16", "i16")
@@ -25,6 +26,9 @@ def test_scalar_value_and_storage_types_are_distinct_where_required():
         assert _model_pair(types.f8E4M3FN) == ("f8E4M3FN", "i8")
         assert _model_pair(types.tf32) == ("tf32", "i32")
         assert _model_pair(types.float32) == ("f32", "f32")
+        assert _model_pair(types._type_fp8_e5m2) == ("f8E5M2", "i8")
+        assert _model_pair(types._type_fp8_e4m3) == ("f8E4M3FN", "i8")
+        assert _model_pair(types._type_fp8_e8m0) == ("f8E8M0FNU", "i8")
 
 
 def test_array_memrefs_use_dtype_storage_type():
