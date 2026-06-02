@@ -36,7 +36,7 @@ from numba_cuda_mlir.numba_cuda.core import errors
 from typing import Any, cast
 from numba_cuda_mlir.logging import trace
 import numpy as np
-from numba_cuda_mlir.numba_cuda.np.arrayobj import numpy_empty_like_nd
+from numba_cuda_mlir.numba_cuda.np.arrayobj import numpy_empty_like_nd, _zero_fill_array_method
 from .ufunc_registry import UFuncRegistry
 
 from numba_cuda_mlir.lowering_utilities import (
@@ -51,6 +51,8 @@ from numba_cuda_mlir.lowering_utilities import (
     try_extract_constant,
     NdIterIterObject,
     is_nonelike,
+    storage_itemsize_bytes,
+    false as false_,
 )
 from numba_cuda_mlir.mlir_lowering import KERNEL_ERROR_CODES
 from numba_cuda_mlir.lowering_utilities.linalg_lowering import (
@@ -85,6 +87,24 @@ def lower_to_fixed_tuple(builder, target, args, kwargs):
         elements.append(elem)
 
     builder.store_var(target, tuple(elements))
+
+
+@lower(_zero_fill_array_method, types.Array)
+def lower_zero_fill_array_method(builder: MLIRLower, target, args, kwargs):
+    array_var = args[0]
+    array = builder.load_var(array_var)
+    array_type = builder.get_numba_type(array_var.name)
+    ptr_as_index = memref_dialect.extract_aligned_pointer_as_index(array)
+    dst_ptr = llvm.inttoptr(llvm.PointerType.get(), convert(ptr_as_index, T.i64()))
+
+    nbytes = constant(storage_itemsize_bytes(array_type.dtype), T.i64())
+    for dim in range(array.type.rank):
+        extent = convert(memref_dialect.dim(array, index_of(dim)), T.i64())
+        nbytes = arith.muli(nbytes, extent)
+
+    llvm.MemsetOp(dst_ptr, constant(0, T.i8()), nbytes, false_())
+    if target is not None:
+        builder.store_var(target, ir.NoneType.get())
 
 
 @lower_getattr(types.Array, "size")

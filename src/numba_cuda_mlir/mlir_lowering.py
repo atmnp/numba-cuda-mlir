@@ -3022,7 +3022,7 @@ extern "C" __global__ void
         value_type = self.get_numba_type(value.name)
         return_ctor = gpu.ReturnOp if isinstance(self.mlir_funcOp, gpu.GPUFuncOp) else func.ReturnOp
         if isinstance(value_type, types.NoneType) or isinstance(
-            self.get_mlir_type(value_type), ir.NoneType
+            self.get_return_type(value_type), ir.NoneType
         ):
             return_ctor([])
         else:
