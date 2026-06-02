@@ -358,6 +358,9 @@ class StringLiteralModel(PrimitiveModel):
         be_type = llvm.PointerType.get()
         super().__init__(dmm, fe_type, be_type)
 
+    def get_return_type(self):
+        return self._dmm.lookup(types.unicode_type).get_value_type()
+
 
 @register_model(types.UnicodeType)
 class UnicodeTypeModel(PrimitiveModel):
