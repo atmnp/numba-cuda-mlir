@@ -17,7 +17,6 @@ from numba_cuda_mlir.numba_cuda.extending import _Intrinsic
 
 from numba_cuda_mlir.numba_cuda.core.environment import Environment
 from numba_cuda_mlir import types
-from numba_cuda_mlir.numba_cuda import types as numba_types
 from numba_cuda_mlir.numba_cuda.datamodel.models import ArrayModel
 from numba_cuda_mlir.annotations import Builder, AnyCallable, PS
 from numba_cuda_mlir.errors import InternalCompilerError, ensure_verifies
@@ -2527,6 +2526,13 @@ extern "C" __global__ void
                 container=struct_val,
                 position=ir.DenseI64ArrayAttr.get([field_idx]),
             )
+            self.incref(target_type, result)
+            self.store_var(target, result)
+            return
+
+        if isinstance(value_type, types.BaseNamedTuple) and attr in value_type.fields:
+            index = value_type.fields.index(attr)
+            result = self.load_var(value)[index]
             self.incref(target_type, result)
             self.store_var(target, result)
             return
