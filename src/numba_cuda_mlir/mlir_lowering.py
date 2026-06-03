@@ -9,6 +9,7 @@ import operator
 from typing import Any, Callable, Sequence
 import numpy as np
 from numba_cuda_mlir.numba_cuda import typing, utils
+from numba_cuda_mlir.numba_cuda import types as numba_types
 from numba_cuda_mlir.numba_cuda.core import targetconfig, errors
 from numba_cuda_mlir.numba_cuda.core import ir as numba_ir
 from numba_cuda_mlir.numba_cuda import dispatcher
@@ -17,7 +18,6 @@ from numba_cuda_mlir.numba_cuda.extending import _Intrinsic
 
 from numba_cuda_mlir.numba_cuda.core.environment import Environment
 from numba_cuda_mlir import types
-from numba_cuda_mlir.numba_cuda import types as numba_types
 from numba_cuda_mlir.numba_cuda.datamodel.models import ArrayModel
 from numba_cuda_mlir.annotations import Builder, AnyCallable, PS
 from numba_cuda_mlir.errors import InternalCompilerError, ensure_verifies
@@ -1652,7 +1652,7 @@ extern "C" __global__ void
 
         folded_argtypes, call_vars, call_argtypes = self._fold_dispatcher_call_args(fn, args, kws)
         func_name = generate_mangled_name(fn.py_func.__qualname__, call_argtypes)
-        cres = fn.compile(folded_argtypes)
+        cres = fn._compile_as_device_callee(folded_argtypes)
 
         if callee_linker := cres.metadata.get("linker"):
             self.linker.merge_ltoirs_from(callee_linker)
@@ -2597,6 +2597,13 @@ extern "C" __global__ void
                 container=struct_val,
                 position=ir.DenseI64ArrayAttr.get([field_idx]),
             )
+            self.incref(target_type, result)
+            self.store_var(target, result)
+            return
+
+        if isinstance(value_type, types.BaseNamedTuple) and attr in value_type.fields:
+            index = value_type.fields.index(attr)
+            result = self.load_var(value)[index]
             self.incref(target_type, result)
             self.store_var(target, result)
             return
