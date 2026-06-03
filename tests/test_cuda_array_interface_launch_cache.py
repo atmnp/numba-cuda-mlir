@@ -54,9 +54,7 @@ def test_cupy_launch_does_not_reconstruct_device_arrays(monkeypatch):
         calls.append((args, kwargs))
         raise AssertionError("launch path should pass CUDA Array Interface objects through")
 
-    monkeypatch.setattr(
-        cuda_api, "from_cuda_array_interface", forbidden_from_cuda_array_interface
-    )
+    monkeypatch.setattr(cuda_api, "from_cuda_array_interface", forbidden_from_cuda_array_interface)
 
     @cuda.jit
     def add(a, b, out):
