@@ -23,7 +23,12 @@ from numba_cuda_mlir.numba_cuda.datamodel.registry import DataModelManager, regi
 from numba_cuda_mlir.numba_cuda.types import misc as nb_types_misc
 from numba_cuda_mlir.numba_cuda.types.ext_types import GridGroup as GridGroupClass
 from numba_cuda_mlir.type_defs import float_types
-from numba_cuda_mlir.numba_cuda.types.containers import StarArgTuple, StarArgUniTuple
+from numba_cuda_mlir.numba_cuda.types.containers import (
+    NamedTuple,
+    NamedUniTuple,
+    StarArgTuple,
+    StarArgUniTuple,
+)
 
 
 class ContextAwareDataModelManager(DataModelManager):
@@ -297,6 +302,7 @@ class OpaqueModel(PrimitiveModel):
 
 
 @register_model(types.Tuple)
+@register_model(NamedTuple)
 @register_model(StarArgTuple)
 class TupleModel(PrimitiveModel):
     """Tuple values are represented as Python tuples of MLIR values."""
@@ -427,6 +433,7 @@ class UnicodeCharSeqModel(PrimitiveModel):
 
 
 @register_model(types.UniTuple)
+@register_model(NamedUniTuple)
 @register_model(StarArgUniTuple)
 class UniTupleModel(PrimitiveModel):
     def __init__(self, dmm, fe_type):
