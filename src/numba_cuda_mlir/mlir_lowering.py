@@ -3493,6 +3493,8 @@ extern "C" __global__ void
         return self._lookup_model(ty).get_argument_type()
 
     def get_return_type(self, ty):
+        if isinstance(ty, types.DTypeSpec):
+            return ir.NoneType.get()
         return self._lookup_model(ty).get_return_type()
 
     def as_storage(self, ty, value):

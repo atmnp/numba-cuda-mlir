@@ -152,6 +152,8 @@ def _(ty: ir.Type | ir.FunctionType) -> types.Type | typing.Signature:
 def _(obj: type) -> types.Type:
     if ctypes._SimpleCData in obj.mro():
         return ctypes_type_to_numba_type(obj)
+    if issubclass(obj, np.generic):
+        return np_dtype_to_numba_dtype(np.dtype(obj))
     raise NotImplementedError(f"Not implemented for type {obj}")
 
 
