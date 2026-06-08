@@ -188,9 +188,7 @@ class TestDTypeSpecLowering:
             make_constructor_template,
         )
 
-        vector_type_class = VectorTypeClass(
-            float16x2, make_constructor_template(float16x2)
-        )
+        vector_type_class = VectorTypeClass(float16x2, make_constructor_template(float16x2))
 
         with ir.Context():
             lower = object.__new__(MLIRLower)
