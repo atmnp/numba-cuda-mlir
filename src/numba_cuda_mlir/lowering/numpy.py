@@ -1182,14 +1182,11 @@ def lower_array_slice_getitem(builder, target, args, kwargs):
         stop = memref.dim(mr, index_of(0))
     if step is None:
         step = index_of(1)
-    starts, stops, steps = [], [], []
-    for i in range(rank - 1):
+    starts, stops, steps = [start], [stop], [step]
+    for i in range(1, rank):
         starts.append(index_of(0))
-        stops.append(memref.dim(mr, index_of(i + 1)))
+        stops.append(memref.dim(mr, index_of(i)))
         steps.append(index_of(1))
-    starts.append(start)
-    stops.append(stop)
-    steps.append(step)
 
     dyn = ir.ShapedType.get_dynamic_stride_or_offset()
     source_strides, _ = mr_type.get_strides_and_offset()
