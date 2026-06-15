@@ -15,9 +15,12 @@ from numba_cuda_mlir.lowering_utilities import (
     DeferredLowering,
     index_of,
     storage_itemsize_bytes,
+    is_complex_type as _is_complex_type,
+    get_llvm_struct_for_complex as _get_llvm_struct_for_complex,
+    complex_to_llvm_struct as _complex_to_llvm_struct,
+    llvm_struct_to_complex as _llvm_struct_to_complex,
 )
 from numba_cuda_mlir._mlir.dialects import llvm, arith, memref
-from numba_cuda_mlir._mlir.dialects import complex as complex_dialect
 from numba_cuda_mlir._mlir import ir
 from numba_cuda_mlir.logging import trace
 from numba_cuda_mlir._mlir.extras import types as T
@@ -28,29 +31,6 @@ lower_getattr = registry.lower_getattr
 llvm_kDynamic = (
     -2147483648
 )  # std::numeric_limits<int32_t>::min(), ugh we need this in the bindings...
-
-
-def _complex_storage_type(mlir_type):
-    if not isinstance(mlir_type, ir.ComplexType):
-        return None
-    elem_type = mlir_type.element_type
-    return llvm.StructType.get_literal([elem_type, elem_type])
-
-
-def _complex_to_storage(value):
-    storage_type = _complex_storage_type(value.type)
-    assert storage_type is not None
-    real = complex_dialect.re(value)
-    imag = complex_dialect.im(value)
-    stored = llvm.UndefOp(storage_type)
-    stored = llvm.insertvalue(stored, real, [0])
-    return llvm.insertvalue(stored, imag, [1])
-
-
-def _complex_from_storage(value, mlir_type):
-    real = llvm.extractvalue(mlir_type.element_type, value, [0])
-    imag = llvm.extractvalue(mlir_type.element_type, value, [1])
-    return complex_dialect.create_(mlir_type, real, imag)
 
 
 @registry.lower(ctypes.pointer, types.Array)
@@ -125,16 +105,17 @@ def lower_pointer_setitem(builder, target, args, kwargs):
             f"Cannot set item on pointer of type {nb_type}, must cast to a typed pointer first"
         )
     idx = convert(idx, T.i64())
-    ele_mlir_ty = builder.get_mlir_type(ele_ty)
+    value_ty = builder.get_mlir_type(ele_ty)
     storage_ty = builder.get_storage_type(ele_ty)
-    if complex_storage_ty := _complex_storage_type(ele_mlir_ty):
-        storage_ty = complex_storage_ty
-        value = convert(value, ele_mlir_ty)
-        value = _complex_to_storage(value)
+    value = convert(value, value_ty)
+    if _is_complex_type(value_ty):
+        gep_ty = _get_llvm_struct_for_complex(value_ty)
+        value = _complex_to_llvm_struct(value)
     else:
+        gep_ty = storage_ty
         value = builder.as_storage(ele_ty, value)
     elementptr = llvm.getelementptr(
-        llvm.PointerType.get(), ptr, [idx], [llvm_kDynamic], storage_ty, None
+        llvm.PointerType.get(), ptr, [idx], [llvm_kDynamic], gep_ty, None
     )
     llvm.store(value, elementptr)
 
@@ -150,19 +131,18 @@ def lower_pointer_getitem(builder, target, args, kwargs):
             f"Cannot get item on pointer of type {nb_type}, must cast to a typed pointer first"
         )
     idx = convert(idx, T.i64())
-    ele_mlir_ty = builder.get_mlir_type(ele_ty)
+    value_ty = builder.get_mlir_type(ele_ty)
     storage_ty = builder.get_storage_type(ele_ty)
-    complex_storage_ty = _complex_storage_type(ele_mlir_ty)
-    if complex_storage_ty is not None:
-        storage_ty = complex_storage_ty
+    gep_ty = _get_llvm_struct_for_complex(value_ty) if _is_complex_type(value_ty) else storage_ty
     elementptr = llvm.getelementptr(
-        llvm.PointerType.get(), ptr, [idx], [llvm_kDynamic], storage_ty, None
+        llvm.PointerType.get(), ptr, [idx], [llvm_kDynamic], gep_ty, None
     )
     # Load the value from the computed address
-    value = llvm.load(storage_ty, elementptr)
-    if complex_storage_ty is not None:
-        value = _complex_from_storage(value, ele_mlir_ty)
+    if _is_complex_type(value_ty):
+        value = llvm.load(gep_ty, elementptr)
+        value = _llvm_struct_to_complex(value, value_ty)
     else:
+        value = llvm.load(storage_ty, elementptr)
         value = builder.from_storage(nb_type.dtype, value)
     builder.incref(nb_type.dtype, value)
     builder.store_var(target, value)
