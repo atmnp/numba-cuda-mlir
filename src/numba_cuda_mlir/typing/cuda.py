@@ -33,6 +33,7 @@ class CArrayTyping(AbstractTemplate):
     from numba_cuda_mlir.cuda import carray
 
     key = carray
+    layout = "C"
 
     def generic(self, args, kws):
         if kws:
@@ -66,10 +67,20 @@ class CArrayTyping(AbstractTemplate):
         if ndim is None:
             return None
 
-        return signature(types.Array(dtype, ndim, "C"), *args)
+        return signature(types.Array(dtype, ndim, self.layout), *args)
 
 
 registry.register_global(CArrayTyping.key, types.Function(CArrayTyping))
+
+
+class FArrayTyping(CArrayTyping):
+    from numba_cuda_mlir.cuda import farray
+
+    key = farray
+    layout = "F"
+
+
+registry.register_global(FArrayTyping.key, types.Function(FArrayTyping))
 
 
 @registry.register

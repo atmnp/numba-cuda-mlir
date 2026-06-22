@@ -72,9 +72,9 @@ from numba_cuda_mlir.numba_cuda.typing.templates import ConcreteTemplate
 from numba_cuda_mlir.numba_cuda import stubs as cuda_stubs
 
 
-def _lower_carray(builder: MLIRLower, target, args, kwargs):
+def _lower_cfarray(builder: MLIRLower, target, args, kwargs, name, layout):
     if kwargs and [name for name, _ in kwargs] != ["dtype"]:
-        raise TypeError("carray only supports dtype as a keyword argument")
+        raise TypeError(f"{name} only supports dtype as a keyword argument")
 
     ptr = builder.load_var(args[0])
     shape = builder.load_var(args[1])
@@ -93,7 +93,8 @@ def _lower_carray(builder: MLIRLower, target, args, kwargs):
 
     strides_i64 = [None] * rank
     stride = constant(1, T.i64())
-    for i in range(rank - 1, -1, -1):
+    indices = range(rank - 1, -1, -1) if layout == "C" else range(rank)
+    for i in indices:
         strides_i64[i] = stride
         stride = arith.muli(stride, sizes_i64[i])
 
@@ -131,7 +132,17 @@ def _lower_carray(builder: MLIRLower, target, args, kwargs):
 @lower(cuda.carray, types.voidptr, types.Integer, types.Any)
 @lower(cuda.carray, types.voidptr, types.BaseTuple, types.Any)
 def lower_carray(builder: MLIRLower, target, args, kwargs):
-    _lower_carray(builder, target, args, kwargs)
+    _lower_cfarray(builder, target, args, kwargs, "carray", "C")
+
+
+@lower(cuda.farray, types.CPointer, types.Integer)
+@lower(cuda.farray, types.CPointer, types.BaseTuple)
+@lower(cuda.farray, types.CPointer, types.Integer, types.Any)
+@lower(cuda.farray, types.CPointer, types.BaseTuple, types.Any)
+@lower(cuda.farray, types.voidptr, types.Integer, types.Any)
+@lower(cuda.farray, types.voidptr, types.BaseTuple, types.Any)
+def lower_farray(builder: MLIRLower, target, args, kwargs):
+    _lower_cfarray(builder, target, args, kwargs, "farray", "F")
 
 
 @lower(cuda_stubs.nanosleep, types.Number)
