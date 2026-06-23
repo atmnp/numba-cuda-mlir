@@ -77,6 +77,10 @@ def restore_compile_arg_types():
     descriptor_mod._compile_arg_types.__dict__.update(state)
 
 
+def _skip_target_resolution(dispatcher, monkeypatch):
+    monkeypatch.setattr(dispatcher, "_resolve_target_options", lambda: None)
+
+
 def test_arg_marshaller_exposes_launch_config_during_launch():
     dispatcher = _Dispatcher()
     launch_config = {
@@ -335,7 +339,34 @@ def test_configure_cache_tracks_mutated_non_launch_extensions(monkeypatch):
     assert generic._extensions == []
     assert updated is not generic
     assert updated._extensions == [extension]
-    assert updated._launch_config is None
+    assert updated._launch_config == generic._launch_config
+
+
+def test_implicit_launch_bounds_enable_launch_config_without_extensions(monkeypatch):
+    def launch_configuration(kernel_dispatcher, griddim, blockdim, stream, sharedmem, cluster):
+        return lambda *args: None
+
+    monkeypatch.setattr(descriptor_mod, "LaunchConfiguration", launch_configuration)
+
+    def kernel(out):
+        pass
+
+    dispatcher = descriptor_mod.MLIRDispatcher(kernel)
+    marshaller = dispatcher.configure((2, 1, 1), (16, 8, 1))
+
+    assert marshaller._launch_config == {
+        "grid": (2, 1, 1),
+        "block": (16, 8, 1),
+        "sharedmem": 0,
+        "cluster": None,
+    }
+    assert marshaller._kernel_dispatcher is not dispatcher._c
+
+    explicit = descriptor_mod.MLIRDispatcher(kernel, targetoptions={"launch_bounds": 128})
+    explicit_marshaller = explicit.configure(2, 32)
+
+    assert explicit_marshaller._launch_config is None
+    assert explicit_marshaller._kernel_dispatcher is explicit._c
 
 
 def test_launch_config_configure_reports_invalid_sharedmem():
@@ -440,6 +471,7 @@ def test_compile_impl_generic_applies_shared_memory_carveout(monkeypatch):
         return CompilerResult()
 
     monkeypatch.setattr(mlir_compiler, "mlir_compiler_entry", mlir_compiler_entry)
+    monkeypatch.setattr(dispatcher, "_resolve_target_options", lambda: None)
     monkeypatch.setattr(
         dispatcher,
         "_apply_shared_memory_carveout",
@@ -551,7 +583,7 @@ def test_plain_kernel_uses_default_native_dispatcher():
     def kernel(out):
         pass
 
-    dispatcher = descriptor_mod.MLIRDispatcher(kernel)
+    dispatcher = descriptor_mod.MLIRDispatcher(kernel, targetoptions={"launch_bounds": 32})
     config = {
         "grid": (1, 1, 1),
         "block": (32, 1, 1),
@@ -674,7 +706,7 @@ def test_launch_config_enabled_tracks_mutated_extensions():
     def kernel():
         pass
 
-    dispatcher = descriptor_mod.MLIRDispatcher(kernel)
+    dispatcher = descriptor_mod.MLIRDispatcher(kernel, targetoptions={"launch_bounds": 32})
     assert (
         dispatcher._get_kernel_dispatcher(
             {
@@ -718,7 +750,12 @@ def test_configure_cache_tracks_mutated_extensions(monkeypatch):
     dispatcher.extensions.append(_LaunchConfigExtension())
     launch_sensitive = dispatcher.configure(1, 32)
 
-    assert generic._launch_config is None
+    assert generic._launch_config == {
+        "grid": (1, 1, 1),
+        "block": (32, 1, 1),
+        "sharedmem": 0,
+        "cluster": None,
+    }
     assert generic_after_clear is not generic
     assert launch_sensitive is not generic
     assert launch_sensitive._launch_config == {
@@ -1159,7 +1196,7 @@ def test_compile_ignores_stale_launch_config_after_extension_removed():
         pass
 
     dispatcher = descriptor_mod.MLIRDispatcher(
-        kernel, targetoptions={"extensions": [_LaunchConfigExtension()]}
+        kernel, targetoptions={"extensions": [_LaunchConfigExtension()], "launch_bounds": 32}
     )
     sig_args = (types.float32,)
     compile_result = _CompileResult(sig_args)
@@ -1200,6 +1237,7 @@ def test_retained_marshaller_compiles_with_extension_snapshot_after_mutation(mon
         return CompilerResult()
 
     monkeypatch.setattr(mlir_compiler, "mlir_compiler_entry", mlir_compiler_entry)
+    _skip_target_resolution(dispatcher, monkeypatch)
 
     launch_config = {
         "grid": (1, 1, 1),
@@ -1235,7 +1273,7 @@ def test_disabled_coercion_ignores_stale_launch_config_after_extension_removed()
         pass
 
     dispatcher = descriptor_mod.MLIRDispatcher(
-        kernel, targetoptions={"extensions": [_LaunchConfigExtension()]}
+        kernel, targetoptions={"extensions": [_LaunchConfigExtension()], "launch_bounds": 32}
     )
     dispatcher.overloads[(types.float32,)] = _CompileResult((types.float32,))
     dispatcher.disable_compile()
@@ -1358,6 +1396,7 @@ def test_compile_impl_launch_config_publishes_aliases_and_skips_disk_cache(monke
         return CompilerResult(tuple(override_argtypes), f"cubin-{len(compile_calls)}".encode())
 
     monkeypatch.setattr(mlir_compiler, "mlir_compiler_entry", mlir_compiler_entry)
+    _skip_target_resolution(dispatcher, monkeypatch)
     monkeypatch.setattr(
         dispatcher._cache,
         "save_overload",
@@ -1407,12 +1446,64 @@ def test_compile_impl_launch_config_publishes_aliases_and_skips_disk_cache(monke
         dispatcher._launch_config_overloads[((types.int64,), second_launch_key)].metadata["cubin"]
         == b"cubin-2"
     )
-    assert not dispatcher.overloads
+    assert dispatcher.overloads
     assert saved_overloads == []
     assert trace_messages == [
         "Persistent disk cache is disabled for launch-config-specialized "
         "compiles because the disk cache key does not include launch metadata."
     ]
+
+
+def test_compile_impl_sets_implicit_launch_bounds_from_launch_config(monkeypatch):
+    from numba_cuda_mlir import mlir_compiler
+
+    def kernel(x):
+        pass
+
+    dispatcher = descriptor_mod.MLIRDispatcher(kernel, targetoptions={"chip": "sm_90"})
+    compile_calls = []
+
+    class CompilerResult:
+        signature = cuda_typing.signature(types.none, types.int32)
+        metadata = {"cubin": b"implicit", "func_name": "kernel"}
+
+    def mlir_compiler_entry(pyfunc, func_args, targetoptions, override_argtypes):
+        compile_calls.append(dict(targetoptions))
+        return CompilerResult()
+
+    monkeypatch.setattr(mlir_compiler, "mlir_compiler_entry", mlir_compiler_entry)
+    monkeypatch.setattr(dispatcher, "_resolve_target_options", lambda: None)
+
+    launch_config = {
+        "grid": (1, 1, 1),
+        "block": (16, 8, 1),
+        "sharedmem": 0,
+        "cluster": None,
+    }
+    launch_key = descriptor_mod._launch_config_key(launch_config)
+    descriptor_mod._compile_arg_types.types = (types.int32,)
+    descriptor_mod._compile_arg_types.launch_config = launch_config
+
+    assert dispatcher._compile_impl([1]) == (b"implicit", "kernel", False)
+
+    assert len(compile_calls) == 1
+    assert "__launch_config__" not in compile_calls[0]
+    assert compile_calls[0]["launch_bounds"] == 128
+    assert dispatcher.targetoptions.get("launch_bounds") is None
+    assert (types.int32,) in dispatcher.overloads
+    assert (
+        dispatcher._launch_config_overloads[((types.int32,), launch_key)].metadata["cubin"]
+        == b"implicit"
+    )
+
+    descriptor_mod._compile_arg_types.launch_config = {
+        "grid": (2, 1, 1),
+        "block": (128, 1, 1),
+        "sharedmem": 0,
+        "cluster": None,
+    }
+    assert dispatcher._compile_impl([1]) == (b"implicit", "kernel", False)
+    assert len(compile_calls) == 1
 
 
 def test_compile_impl_launch_config_separates_same_signature_by_grid(monkeypatch):
@@ -1436,6 +1527,7 @@ def test_compile_impl_launch_config_separates_same_signature_by_grid(monkeypatch
         return CompilerResult(f"cubin-{len(compile_calls)}".encode())
 
     monkeypatch.setattr(mlir_compiler, "mlir_compiler_entry", mlir_compiler_entry)
+    _skip_target_resolution(dispatcher, monkeypatch)
 
     first_launch_config = {
         "grid": (1, 1, 1),
@@ -1516,6 +1608,7 @@ def test_compile_impl_discards_callbacks_after_generation_retry(monkeypatch):
         return CompilerResult(b"accepted", accepted_setup_callback)
 
     monkeypatch.setattr(mlir_compiler, "mlir_compiler_entry", mlir_compiler_entry)
+    _skip_target_resolution(dispatcher, monkeypatch)
     descriptor_mod._compile_arg_types.types = (types.int32,)
     descriptor_mod._compile_arg_types.launch_config = launch_config
 
@@ -1563,6 +1656,7 @@ def test_compile_impl_discards_callbacks_from_duplicate_launch_compile(monkeypat
         return CompilerResult()
 
     monkeypatch.setattr(mlir_compiler, "mlir_compiler_entry", mlir_compiler_entry)
+    _skip_target_resolution(dispatcher, monkeypatch)
     descriptor_mod._compile_arg_types.types = (types.int32,)
     descriptor_mod._compile_arg_types.launch_config = launch_config
 
@@ -1639,6 +1733,7 @@ def test_compile_launch_config_signature_forces_launch_rebuild_without_extension
         return CompilerResult()
 
     monkeypatch.setattr(mlir_compiler, "mlir_compiler_entry", mlir_compiler_entry)
+    _skip_target_resolution(dispatcher, monkeypatch)
 
     with pytest.warns(
         descriptor_mod.NumbaPerformanceWarning,
@@ -1664,7 +1759,7 @@ def test_disabled_launch_config_reduce_skips_launch_sigs_after_extension_removed
         pass
 
     dispatcher = descriptor_mod.MLIRDispatcher(
-        kernel, targetoptions={"extensions": [_LaunchConfigExtension()]}
+        kernel, targetoptions={"extensions": [_LaunchConfigExtension()], "launch_bounds": 32}
     )
     launch_config = {
         "grid": (1, 1, 1),
@@ -1723,3 +1818,28 @@ def test_launch_config_specializes_same_signature_launches():
     assert kernel.signatures
     assert kernel.nopython_signatures
     assert kernel.launch_config_overloads
+
+
+@pytest.mark.skipif(not cuda.is_available(), reason="CUDA GPU required")
+def test_implicit_launch_bounds_specializes_same_signature_launches():
+    @cuda.jit
+    def kernel():
+        pass
+
+    kernel[1, 32]()
+    kernel[1, 64]()
+
+    mlir_by_key = kernel.inspect_mlir()
+    launch_entries = {
+        tuple(dict(key.launch_config_key)["block"]): mlir
+        for key, mlir in mlir_by_key.items()
+        if isinstance(key, descriptor_mod.LaunchConfigInspectableKey)
+    }
+
+    generic_sig = next(iter(kernel.overloads))
+    generic_mlir = kernel.inspect_mlir(generic_sig)
+    assert "nvvm.maxntid" in generic_mlir
+    assert "32" in generic_mlir
+    assert set(launch_entries) == {(64, 1, 1)}
+    assert "nvvm.maxntid" in launch_entries[(64, 1, 1)]
+    assert "64" in launch_entries[(64, 1, 1)]

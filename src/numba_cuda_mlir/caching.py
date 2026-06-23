@@ -130,6 +130,7 @@ class MLIRCache(Cache):
             ("lto", targetoptions.get("lto")),
             ("output", targetoptions.get("output", "ptx")),
             ("chip", gpu_target["chip"]),
+            ("launch_bounds", targetoptions.get("launch_bounds")),
         )
         return (*key, option_key)
 

@@ -380,6 +380,14 @@ def _launch_config_dict_from_key(launch_config_key):
     return {name: value for name, value in launch_config_key}
 
 
+def _launch_config_thread_count(launch_config):
+    block = launch_config["block"]
+    threads = 1
+    for dim in block:
+        threads *= dim
+    return threads
+
+
 def _normalize_launch_sharedmem(sharedmem):
     if sharedmem is None:
         return 0
@@ -539,8 +547,16 @@ class _ArgMarshaller:
         extensions = (
             self._extensions if self._has_extension_snapshot else getattr(disp, "extensions", ())
         )
+        extensions_use_launch_config = _extensions_use_launch_config(extensions)
+        implicit_launch_bounds_only = (
+            not extensions_use_launch_config
+            and disp is not None
+            and getattr(disp, "_implicit_launch_bounds_enabled", False)
+        )
         active_launch_config = (
-            self._launch_config if _extensions_use_launch_config(extensions) else None
+            self._launch_config
+            if (extensions_use_launch_config or implicit_launch_bounds_only)
+            else None
         )
         active_launch_config_key = _launch_config_key(active_launch_config)
         if active_launch_config_key is None:
@@ -555,6 +571,8 @@ class _ArgMarshaller:
             best, has_match = disp._resolve_overload(argtypes, allow_unsafe=True)
         else:
             overload_argtypes = disp._launch_config_overload_argtypes(active_launch_config_key)
+            if not overload_argtypes and implicit_launch_bounds_only:
+                overload_argtypes = tuple(disp.overloads)
             if not overload_argtypes:
                 return device_args, argtypes
             for sig_args in overload_argtypes:
@@ -1530,7 +1548,14 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
 
     @property
     def _launch_config_enabled(self):
-        return _extensions_use_launch_config(self.extensions)
+        return _extensions_use_launch_config(self.extensions) or self._implicit_launch_bounds_enabled
+
+    @property
+    def _implicit_launch_bounds_enabled(self):
+        return (
+            not self.targetoptions.get("device", False)
+            and self.targetoptions.get("launch_bounds") is None
+        )
 
     def _get_kernel_dispatcher(self, launch_config):
         dispatcher, _ = self._get_kernel_dispatcher_and_generation(launch_config)
@@ -1674,11 +1699,18 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
         griddim, blockdim = normalize_kernel_dimensions(griddim, blockdim)
         if cluster is not None:
             cluster = normalize_kernel_dimensions(cluster, (1, 1, 1))[0]
-        launch_config_enabled = self._launch_config_enabled
+        launch_config_enabled = _extensions_use_launch_config(self.extensions)
         extension_key = tuple(_ObjectIdentityKey(ext) for ext in self.extensions)
         configured_sharedmem = sharedmem
         if launch_config_enabled:
             configured_sharedmem = _normalize_launch_sharedmem(sharedmem)
+        elif self._implicit_launch_bounds_enabled:
+            try:
+                configured_sharedmem = _normalize_launch_sharedmem(sharedmem)
+            except TypeError:
+                pass
+            else:
+                launch_config_enabled = True
         cache_key = (
             launch_config_enabled,
             extension_key,
@@ -2318,17 +2350,28 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
                 if cb not in self._module_teardown_callbacks:
                     self._module_teardown_callbacks.append(cb)
 
-    def _find_launch_config_overload_locked(self, argtypes, launch_config_key):
+    def _find_launch_config_overload_locked(
+        self, argtypes, launch_config_key, implicit_launch_bounds=False
+    ):
         # Exact hits are O(1). Compatible fallback scans the bounded launch
         # overload table to preserve existing overload-reuse semantics.
         exact = self._launch_config_overloads.get((argtypes, launch_config_key))
         if exact is not None:
             return exact
+        implicit_threads = None
+        if implicit_launch_bounds:
+            implicit_threads = _launch_config_thread_count(
+                _launch_config_dict_from_key(launch_config_key)
+            )
         reusable = None
         for (sig_args, key), cres in self._launch_config_overloads.items():
+            if implicit_threads is not None:
+                if _launch_config_thread_count(_launch_config_dict_from_key(key)) != implicit_threads:
+                    continue
+            elif key != launch_config_key:
+                continue
             if (
-                key == launch_config_key
-                and len(sig_args) == len(argtypes)
+                len(sig_args) == len(argtypes)
                 and all(self._can_reuse_overload(s, r) for s, r in zip(sig_args, argtypes))
             ):
                 reusable = cres
@@ -2408,8 +2451,13 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
         if not has_extension_snapshot:
             active_extensions = self.extensions
         force_launch_config = getattr(_compile_arg_types, "force_launch_config", False)
+        implicit_launch_bounds = self._implicit_launch_bounds_enabled
+        extensions_use_launch_config = _extensions_use_launch_config(active_extensions)
+        implicit_launch_bounds_only = implicit_launch_bounds and not (
+            force_launch_config or extensions_use_launch_config
+        )
         active_launch_config = None
-        if force_launch_config or _extensions_use_launch_config(active_extensions):
+        if force_launch_config or extensions_use_launch_config or implicit_launch_bounds:
             active_launch_config = getattr(_compile_arg_types, "launch_config", None)
         active_launch_config_key = _launch_config_key(active_launch_config)
         active_launch_config_generation = None
@@ -2431,7 +2479,9 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
             # launch.
             with self._launch_config_lock:
                 reusable = self._find_launch_config_overload_locked(
-                    argtypes, active_launch_config_key
+                    argtypes,
+                    active_launch_config_key,
+                    implicit_launch_bounds=implicit_launch_bounds_only,
                 )
                 if reusable is not None:
                     self._launch_config_cache_hits[(argtypes, active_launch_config_key)] += 1
@@ -2448,8 +2498,15 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
                 with self._launch_config_lock:
                     candidate_overloads = {}
                     for (sig_args, key), cres in self._launch_config_overloads.items():
-                        if key == active_launch_config_key:
-                            candidate_overloads[sig_args] = cres
+                        if implicit_launch_bounds_only:
+                            if (
+                                _launch_config_thread_count(_launch_config_dict_from_key(key))
+                                != _launch_config_thread_count(active_launch_config)
+                            ):
+                                continue
+                        elif key != active_launch_config_key:
+                            continue
+                        candidate_overloads[sig_args] = cres
                 generic_note = (
                     f"; {len(self.overloads)} generic overload(s) ignored because "
                     "active extensions use launch metadata"
@@ -2462,6 +2519,15 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
                     candidate_sig_args=tuple(candidate_overloads),
                 )
                 if not has_any:
+                    if implicit_launch_bounds_only:
+                        best, has_any = self._resolve_overload(argtypes, allow_unsafe=True)
+                        if not has_any:
+                            raise TypeError(
+                                f"No matching definition for argument type(s) {argtypes}"
+                            )
+                        if len(best) > 1:
+                            self._raise_ambiguous(argtypes, best)
+                        return _result(self.overloads[best[0]])
                     # Generic overloads are not a safe fallback here: opt-in
                     # extensions may lower code from __launch_config__ metadata.
                     raise TypeError(
@@ -2498,23 +2564,40 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
             if has_extension_snapshot:
                 targetoptions["extensions"] = active_extensions
             if active_launch_config is not None:
-                targetoptions["__launch_config__"] = dict(active_launch_config)
+                if force_launch_config or extensions_use_launch_config:
+                    targetoptions["__launch_config__"] = dict(active_launch_config)
+                if implicit_launch_bounds:
+                    targetoptions["launch_bounds"] = _launch_config_thread_count(
+                        active_launch_config
+                    )
+        cache = self._cache
+        if implicit_launch_bounds_only and active_launch_config_key is not None:
+            if not isinstance(self._cache, NullCache):
+                cache = MLIRCache(self.py_func, targetoptions)
 
         # Try to load from disk cache
         mlir_target.ensure_initialized()
         sig = typing.signature(types.none, *argtypes)
         # Launch-specialized compiles use an in-memory cache because the
         # generic in-memory and on-disk cache keys do not include launch metadata.
-        if active_launch_config_key is None:
-            cres = self._cache.load_overload(sig, mlir_target.target_context)
+        if active_launch_config_key is None or implicit_launch_bounds_only:
+            cres = cache.load_overload(sig, mlir_target.target_context)
             if cres is not None:
                 self._cache_hits[argtypes] += 1
                 wrapped = CompileResult(cres)
-                self.overloads[argtypes] = wrapped
+                if active_launch_config_key is None:
+                    self.overloads[argtypes] = wrapped
+                else:
+                    with self._launch_config_lock:
+                        self._launch_config_overloads.setdefault(
+                            (tuple(wrapped.signature.args), active_launch_config_key), wrapped
+                        )
+                    if implicit_launch_bounds_only:
+                        self.overloads.setdefault(tuple(wrapped.signature.args), wrapped)
                 return _result(wrapped)
 
         # Cache miss - need to compile
-        if active_launch_config_key is None:
+        if active_launch_config_key is None or implicit_launch_bounds_only:
             self._cache_misses[argtypes] += 1
 
         # Compile using mlir_compiler_entry which handles annotations and AST transforms
@@ -2535,11 +2618,15 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
                     retry_launch_config_compile = True
                 else:
                     existing = self._find_launch_config_overload_locked(
-                        argtypes, active_launch_config_key
+                        argtypes,
+                        active_launch_config_key,
+                        implicit_launch_bounds=implicit_launch_bounds_only,
                     )
                     if existing is None and normalized_args != argtypes:
                         existing = self._find_launch_config_overload_locked(
-                            normalized_args, active_launch_config_key
+                            normalized_args,
+                            active_launch_config_key,
+                            implicit_launch_bounds=implicit_launch_bounds_only,
                         )
                     if existing is not None:
                         # A duplicate compile can lose a race to another thread that
@@ -2547,8 +2634,11 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
                         # without publishing callbacks from an unused module.
                         return _result(existing)
                     self._launch_config_cache_misses[(argtypes, active_launch_config_key)] += 1
-                    emit_launch_config_cache_notice = not self._launch_config_cache_notice_emitted
-                    self._launch_config_cache_notice_emitted = True
+                    if not implicit_launch_bounds_only:
+                        emit_launch_config_cache_notice = (
+                            not self._launch_config_cache_notice_emitted
+                        )
+                        self._launch_config_cache_notice_emitted = True
                     self._propagate_compile_callbacks(result.metadata)
                     self._apply_shared_memory_carveout(wrapped)
                     # Preserve both the native dispatcher request types and the
@@ -2559,6 +2649,8 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
                     self._launch_config_overloads.setdefault(
                         (normalized_args, active_launch_config_key), wrapped
                     )
+                    if implicit_launch_bounds_only:
+                        self.overloads.setdefault(normalized_args, wrapped)
             if retry_launch_config_compile:
                 if launch_config_retry_budget <= 0:
                     raise RuntimeError(
@@ -2579,8 +2671,8 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
             self.overloads[result.signature.args] = wrapped
 
         # Save to disk cache
-        if active_launch_config_key is None:
-            self._cache.save_overload(sig, result)
+        if active_launch_config_key is None or implicit_launch_bounds_only:
+            cache.save_overload(sig, result)
 
         return _result(wrapped)
 
