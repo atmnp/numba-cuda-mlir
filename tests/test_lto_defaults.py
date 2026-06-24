@@ -5,7 +5,7 @@
 import pytest
 
 from numba_cuda_mlir import cuda
-from numba_cuda_mlir.linker import resolve_link_plan
+from numba_cuda_mlir.linker import Linker, resolve_link_plan
 
 
 def _kernel():
@@ -76,6 +76,16 @@ def test_link_plan_allows_debug_ptx_with_implicit_ltoir_input():
 
     assert plan.compile_new_inputs_as_ltoir is False
     assert plan.has_ltoir_link_items is True
+
+
+def test_cu_source_uses_resolved_lto_mode_after_lto_enabled():
+    cu_source = cuda.CUSource("")
+    linker = Linker(cc=(8, 0), arch="sm_80", lto=True)
+
+    linker.add_file_guess_ext(cu_source, compile_cu_as_ltoir=False)
+
+    assert linker.lto is True
+    assert linker._pending_cu == [("linkable", cu_source, cu_source.name, False)]
 
 
 def test_link_plan_lineinfo_preserves_implicit_lto_for_ltoir_inputs():

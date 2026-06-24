@@ -255,7 +255,9 @@ class MLIRLower(object):
         )
         linker = self._create_linker(link_plan)
         for link_item in self._linked_external_link_items:
-            linker.add_file_guess_ext(link_item)
+            linker.add_file_guess_ext(
+                link_item, compile_cu_as_ltoir=link_plan.compile_new_inputs_as_ltoir
+            )
         for ltoir in self._linked_ltoirs:
             linker.add_ltoir(ltoir)
         self.metadata["link_plan"] = link_plan

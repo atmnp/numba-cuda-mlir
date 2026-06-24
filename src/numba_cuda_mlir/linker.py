@@ -18,6 +18,12 @@ def _link_item_is_ltoir(link_item) -> bool:
     return type(link_item).__name__ == "LTOIR"
 
 
+def _link_item_is_cuda_source(link_item) -> bool:
+    if isinstance(link_item, str):
+        return link_item.endswith(".cu")
+    return type(link_item).__name__ == "CUSource"
+
+
 @dataclass(frozen=True)
 class ResolvedLinkPlan:
     """Resolved JIT link policy.
@@ -121,6 +127,19 @@ class Linker(_Linker):
 
         self._numba_cuda_mlir_temp_ptx_files: list[str] = []
         self._ltoirs: dict[int, bytes] = {}
+
+    def add_file_guess_ext(
+        self, path_or_code, ignore_nonlto=False, compile_cu_as_ltoir: bool | None = None
+    ):
+        if compile_cu_as_ltoir is None or not _link_item_is_cuda_source(path_or_code):
+            return super().add_file_guess_ext(path_or_code, ignore_nonlto=ignore_nonlto)
+
+        old_lto = self.lto
+        self.lto = compile_cu_as_ltoir
+        try:
+            return super().add_file_guess_ext(path_or_code, ignore_nonlto=ignore_nonlto)
+        finally:
+            self.lto = old_lto
 
     def recreate_with_lto(self, lto: bool = True, ltoir_only: bool = False) -> Self:
         """Recreate the linker, re-adding all object codes from raw bytes.
