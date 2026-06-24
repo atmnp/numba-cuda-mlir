@@ -2724,7 +2724,7 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
         ptx = cres.metadata.get("lto_ptx")
         if ptx:
             return ptx
-        if not cres.metadata.get("ltoir"):
+        if not cres.metadata.get("ltoir") and not cres.metadata.get("mlir_module_optimized"):
             return self.inspect_ptx(args)
 
         from numba_cuda_mlir.mlir_optimization import get_lto_ptx

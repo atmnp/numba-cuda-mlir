@@ -2028,6 +2028,7 @@ extern "C" __global__ void
         has_teardown_callback = (
             hasattr(link_item, "teardown_callback") and link_item.teardown_callback
         )
+        link_item_is_ltoir = self._link_item_is_ltoir(link_item)
         if (
             (has_setup_callback or has_teardown_callback)
             and not self.targetoptions.get("_lto_explicit", False)
@@ -2040,7 +2041,7 @@ extern "C" __global__ void
                 self.linker = self._create_linker()
                 for prior_link_item in self._linked_external_link_items:
                     self.linker.add_file_guess_ext(prior_link_item)
-        elif self._can_enable_implicit_lto_for_external_link_item():
+        elif self._can_enable_implicit_lto_for_external_link_item(link_item):
             self.targetoptions["lto"] = True
             if not self._linker_config["lto"]:
                 self._linker_config["lto"] = True
@@ -2048,14 +2049,20 @@ extern "C" __global__ void
                 for prior_link_item in self._linked_external_link_items:
                     self.linker.add_file_guess_ext(prior_link_item)
 
+        if link_item_is_ltoir and not self._linker_config["lto"]:
+            raise ValueError("LTOIR link inputs require LTO; leave lto unset or set lto=True.")
+
         if has_setup_callback:
             self._setup_callbacks.append(link_item.setup_callback)
         if has_teardown_callback:
             self._teardown_callbacks.append(link_item.teardown_callback)
         self.linker.add_file_guess_ext(link_item)
         self._linked_external_link_items.append(link_item)
+        self.metadata["external_link_items"] = list(self._linked_external_link_items)
 
-    def _can_enable_implicit_lto_for_external_link_item(self) -> bool:
+    def _can_enable_implicit_lto_for_external_link_item(self, link_item) -> bool:
+        if not self._link_item_is_ltoir(link_item):
+            return False
         if self.targetoptions.get("lto", False):
             return False
         if self.targetoptions.get("_lto_explicit", False):
@@ -2064,12 +2071,18 @@ extern "C" __global__ void
             return False
         if self._setup_callbacks or self._teardown_callbacks:
             return False
-        if self.targetoptions.get("debug") or self.targetoptions.get("lineinfo"):
+        if self.targetoptions.get("debug"):
             return False
 
         from numba_cuda_mlir.numba_cuda.cudadrv.driver import _have_nvjitlink
 
         return _have_nvjitlink()
+
+    @staticmethod
+    def _link_item_is_ltoir(link_item) -> bool:
+        if isinstance(link_item, str):
+            return link_item.endswith(".ltoir")
+        return type(link_item).__name__ == "LTOIR"
 
     @staticmethod
     def _external_link_item_key(link_item):

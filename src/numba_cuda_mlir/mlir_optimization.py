@@ -362,11 +362,66 @@ def get_ptx(cres, target_options=None) -> str:
     return ptx.decode()
 
 
+def _compile_ltoir_for_inspection(cres, target_options) -> bytes:
+    ltoir = cres.metadata.get("ltoir")
+    if ltoir:
+        return ltoir
+
+    with context.get_context():
+        module = ir.Module.parse(cres.metadata["mlir_module_optimized"])
+        run_pre_codegen_patterns(module)
+
+        chip = target_options.get("chip")
+        if not chip:
+            from numba_cuda_mlir.tools import get_gpu_compute_capability
+
+            chip = get_gpu_compute_capability()
+        cc = chip.replace("sm_", "")
+
+        if _needs_llvm70_path(cc):
+            ltoir = _call_llvm70_capi(module, target_options, gen_lto=True)
+        else:
+            llvm_ir = _prepare_llvm_ir(
+                module,
+                dump=target_options.get("dump_llvmir", False),
+                preserve_debug_info=target_options.get("debug", False)
+                or target_options.get("lineinfo", False),
+            )
+            from numba_cuda_mlir.numba_cuda.cudadrv.nvvm import LibDevice
+
+            libdevice = LibDevice()
+            nvvm_opts = _nvvm_options(cc, target_options)
+            ltoir = _compile_to_ltoir(llvm_ir, libdevice, nvvm_opts)
+
+    cres.metadata["ltoir"] = ltoir
+    return ltoir
+
+
 def _dump_module(mod, header):
     print(header, end="\n\n")
     # Include loc and #llvm.di_* when present (e.g. debug/lineinfo).
     mod.operation.print(enable_debug_info=True)
     print("\n\n")
+
+
+def _linker_used_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
+def _root_linker_entry_kernel(linker, func_name):
+    if (
+        getattr(linker, "variables_used", None) is None
+        and getattr(linker, "kernels_used", None) is None
+    ):
+        return
+    kernels_used = _linker_used_list(getattr(linker, "kernels_used", None))
+    if func_name not in kernels_used:
+        kernels_used.append(func_name)
+    linker.kernels_used = kernels_used
 
 
 def _find_dbg_var_name(loc):
@@ -465,6 +520,7 @@ def get_lto_ptx(cres, linker=None, target_options=None) -> str:
         return ptx
     if target_options is None:
         target_options = cres.metadata["targetoptions"]
+    created_linker = False
     if linker is None:
         linker = cres.metadata.get("linker")
     if linker is None:
@@ -494,13 +550,16 @@ def get_lto_ptx(cres, linker=None, target_options=None) -> str:
             ptxas_options=target_options.get("ptxas_options", None),
             max_registers=target_options.get("max_registers", None),
         )
+        created_linker = True
 
+    replay_link_items = created_linker or not getattr(linker, "lto", False)
     diag_linker = linker.recreate_with_lto(lto=True, ltoir_only=True)
     diag_linker.additional_flags = ["-ptx"]
-    ltoir = cres.metadata.get("ltoir")
-    if ltoir:
-        diag_linker.add_ltoir(ltoir)
-    for link_file in target_options.get("link", []):
+    diag_linker.add_ltoir(_compile_ltoir_for_inspection(cres, target_options))
+    link_items = cres.metadata.get("external_link_items")
+    if link_items is None:
+        link_items = target_options.get("link", [])
+    for link_file in link_items if replay_link_items else ():
         diag_linker.add_file_guess_ext(link_file, ignore_nonlto=True)
     if cres.metadata.get("needs_nrt") and not cres.metadata.get("nrt_inline"):
         _maybe_link_nrt(diag_linker)
@@ -603,6 +662,8 @@ def optimize(cres):
                 print(f"=============== PTX ===============\n\n{cres.metadata['ptx']}\n\n")
             linker.add_ptx(ptx)
 
+        func_name = generate_mangled_name(cres.fndesc.qualname, cres.fndesc.argtypes)
+        _root_linker_entry_kernel(linker, func_name)
         code = linker.complete()
         cres.metadata["cubin"] = code.code
 
@@ -622,9 +683,7 @@ def optimize(cres):
 
         # TODO: parse CC from the object and ensure it's not greater than the
         # greatest supported CC via _get_gpu_compute_capability()
-        cres.metadata["func_name"] = generate_mangled_name(
-            cres.fndesc.qualname, cres.fndesc.argtypes
-        )
+        cres.metadata["func_name"] = func_name
 
         cres.library._ptx = cres.metadata["ptx"]
         cres.library._mlir_str = cres.metadata["mlir_module_optimized"]

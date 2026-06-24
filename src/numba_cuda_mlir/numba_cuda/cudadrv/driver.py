@@ -2204,6 +2204,7 @@ class _Linker:
         prec_sqrt=None,
         fma=None,
         optimize_unused_variables=None,
+        kernels_used=None,
         variables_used=None,
         optimization_level=3,
         ptxas_options=None,
@@ -2233,6 +2234,7 @@ class _Linker:
         self._prec_sqrt = prec_sqrt
         self._fma = fma
         self._optimize_unused_variables = optimize_unused_variables
+        self.kernels_used = kernels_used
         self.variables_used = variables_used
         self._optimization_level = optimization_level
         self._ptxas_options = ptxas_options
@@ -2450,6 +2452,7 @@ class _Linker:
             prec_div=self._prec_div,
             prec_sqrt=self._prec_sqrt,
             fma=self._fma,
+            kernels_used=self.kernels_used,
             variables_used=self.variables_used,
             optimize_unused_variables=(
                 self._optimize_unused_variables if self.variables_used else None

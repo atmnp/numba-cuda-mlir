@@ -138,9 +138,15 @@ class TestLinker(NumbaCUDATestCase):
         linker = _Linker(
             max_registers=0,
             cc=(7, 5),
+            kernels_used=["retained_kernel"],
             variables_used=["retained_global", "another_global"],
         )
 
+        self.assertEqual(linker.kernels_used, ["retained_kernel"])
+        self.assertEqual(
+            linker._get_linker_options(ptx=False).kernels_used,
+            ["retained_kernel"],
+        )
         self.assertEqual(linker.variables_used, ["retained_global", "another_global"])
         self.assertEqual(
             linker._get_linker_options(ptx=False).variables_used,
@@ -192,11 +198,17 @@ class TestLinker(NumbaCUDATestCase):
     def test_public_linker_preserves_variables_used_when_recreated_with_lto(self):
         linker = NumbaCudaMLIRLinker(
             cc=(7, 5),
+            kernels_used=["retained_kernel"],
             variables_used=["retained_global"],
         )
 
         recreated = linker.recreate_with_lto()
 
+        self.assertEqual(recreated.kernels_used, ["retained_kernel"])
+        self.assertEqual(
+            recreated._get_linker_options(ptx=False).kernels_used,
+            ["retained_kernel"],
+        )
         self.assertEqual(recreated.variables_used, ["retained_global"])
         self.assertEqual(
             recreated._get_linker_options(ptx=False).variables_used,
