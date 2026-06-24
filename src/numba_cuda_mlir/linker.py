@@ -1,8 +1,79 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+from dataclasses import dataclass
 from typing import Self
 from numba_cuda_mlir.tools import get_gpu_compute_capability, format_arch
 from numba_cuda_mlir.numba_cuda.cudadrv.driver import _Linker
+
+
+def _link_item_has_callbacks(link_item) -> bool:
+    return bool(getattr(link_item, "setup_callback", None)) or bool(
+        getattr(link_item, "teardown_callback", None)
+    )
+
+
+def _link_item_is_ltoir(link_item) -> bool:
+    if isinstance(link_item, str):
+        return link_item.endswith(".ltoir")
+    return type(link_item).__name__ == "LTOIR"
+
+
+@dataclass(frozen=True)
+class ResolvedLinkPlan:
+    """Resolved JIT link policy.
+
+    ``compile_new_inputs_as_ltoir`` controls newly generated inputs: the current
+    MLIR module and CUDA source link items. Existing LTOIR link inputs still
+    make the CUDA linker use LTO even when this flag is false.
+    """
+
+    compile_new_inputs_as_ltoir: bool
+    lto_explicit: bool
+    requested_lto: bool
+    compile_output: str
+    has_external_link_items: bool
+    has_ltoir_link_items: bool
+    has_callback_link_items: bool
+
+
+def resolve_link_plan(targetoptions: dict, link_items=(), extra_ltoir_items=()) -> ResolvedLinkPlan:
+    link_items = tuple(link_items or ())
+    extra_ltoir_items = tuple(extra_ltoir_items or ())
+    lto_explicit = bool(targetoptions.get("_lto_explicit", False))
+    requested_lto = bool(targetoptions.get("lto", False))
+    compile_output = targetoptions.get("_compile_output", "ptx")
+    has_external_link_items = bool(link_items)
+    has_ltoir_link_items = bool(extra_ltoir_items) or any(
+        _link_item_is_ltoir(link_item) for link_item in link_items
+    )
+    has_callback_link_items = any(_link_item_has_callbacks(link_item) for link_item in link_items)
+
+    if compile_output not in ("ptx", "ltoir"):
+        raise ValueError(f"Unsupported compile output: {compile_output}")
+
+    if has_ltoir_link_items and lto_explicit and not requested_lto:
+        raise ValueError("Cannot link LTOIR inputs with lto=False")
+
+    if compile_output == "ltoir":
+        compile_new_inputs_as_ltoir = True
+    elif lto_explicit:
+        compile_new_inputs_as_ltoir = requested_lto
+    elif requested_lto:
+        compile_new_inputs_as_ltoir = True
+    elif has_callback_link_items or targetoptions.get("debug", False):
+        compile_new_inputs_as_ltoir = False
+    else:
+        compile_new_inputs_as_ltoir = has_ltoir_link_items
+
+    return ResolvedLinkPlan(
+        compile_new_inputs_as_ltoir=compile_new_inputs_as_ltoir,
+        lto_explicit=lto_explicit,
+        requested_lto=requested_lto,
+        compile_output=compile_output,
+        has_external_link_items=has_external_link_items,
+        has_ltoir_link_items=has_ltoir_link_items,
+        has_callback_link_items=has_callback_link_items,
+    )
 
 
 class Linker(_Linker):

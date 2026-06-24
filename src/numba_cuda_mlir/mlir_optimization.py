@@ -325,6 +325,41 @@ def _compile_to_ltoir(llvm_ir: bytes, libdevice, nvvm_opts: dict) -> bytes:
     return cu.compile()
 
 
+def _get_ltoir(cres, target_options) -> bytes:
+    ltoir = cres.metadata.get("ltoir")
+    if ltoir:
+        return ltoir
+
+    with context.get_context():
+        module = ir.Module.parse(cres.metadata["mlir_module_optimized"])
+        run_pre_codegen_patterns(module)
+
+        chip = target_options.get("chip")
+        if not chip:
+            from numba_cuda_mlir.tools import get_gpu_compute_capability
+
+            chip = get_gpu_compute_capability()
+        cc = chip.replace("sm_", "")
+
+        if _needs_llvm70_path(cc):
+            ltoir = _call_llvm70_capi(module, target_options, gen_lto=True)
+        else:
+            llvm_ir = _prepare_llvm_ir(
+                module,
+                dump=target_options.get("dump_llvmir", False),
+                preserve_debug_info=target_options.get("debug", False)
+                or target_options.get("lineinfo", False),
+            )
+            from numba_cuda_mlir.numba_cuda.cudadrv.nvvm import LibDevice
+
+            libdevice = LibDevice()
+            nvvm_opts = _nvvm_options(cc, target_options)
+            ltoir = _compile_to_ltoir(llvm_ir, libdevice, nvvm_opts)
+
+    cres.metadata["ltoir"] = ltoir
+    return ltoir
+
+
 def get_ptx(cres, target_options=None) -> str:
     """Return regular PTX lazily for inspection without doing it during LTO compilation."""
     ptx = cres.metadata.get("ptx")
@@ -497,10 +532,8 @@ def get_lto_ptx(cres, linker=None, target_options=None) -> str:
 
     diag_linker = linker.recreate_with_lto(lto=True, ltoir_only=True)
     diag_linker.additional_flags = ["-ptx"]
-    ltoir = cres.metadata.get("ltoir")
-    if ltoir:
-        diag_linker.add_ltoir(ltoir)
-    for link_file in target_options.get("link", []):
+    diag_linker.add_ltoir(_get_ltoir(cres, target_options))
+    for link_file in cres.metadata.get("linked_external_link_items", target_options.get("link", [])):
         diag_linker.add_file_guess_ext(link_file, ignore_nonlto=True)
     if cres.metadata.get("needs_nrt") and not cres.metadata.get("nrt_inline"):
         _maybe_link_nrt(diag_linker)
@@ -562,7 +595,13 @@ def optimize(cres):
 
             chip = get_gpu_compute_capability()
         cc = chip.replace("sm_", "")
-        is_lto = target_options.get("lto", False) or target_options.get("output", "ptx") == "ltoir"
+        link_plan = cres.metadata.get("link_plan")
+        is_lto = (
+            link_plan.compile_new_inputs_as_ltoir
+            if link_plan is not None
+            else target_options.get("lto", False)
+            or target_options.get("_compile_output") == "ltoir"
+        )
 
         from numba_cuda_mlir.numba_cuda.cudadrv.nvvm import LibDevice
 
