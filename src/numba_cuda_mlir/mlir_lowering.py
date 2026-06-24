@@ -229,6 +229,7 @@ class MLIRLower(object):
         self._mlir_gpu_module: gpu.GPUModuleOp | None = None
         self._shared_memory_base: ir.Value | None = None
         self._total_shared_memory_bytes: ir.Value | None = None
+        self._dynamic_shared_memory_values: list[ir.Value] = []
         self._deferred_dbg_declare_vars: set[str] = set()
         self._debug_forced_alloca: set[str] = set()
         self._poly_dbg_alloca: dict[str, ir.Value] = {}
@@ -2335,7 +2336,11 @@ extern "C" __global__ void
                 sizes=[size],
             )
             self._total_shared_memory_bytes = dynamic_shared_bytes
+        self._dynamic_shared_memory_values.append(view)
         return view
+
+    def _is_dynamic_shared_memory(self, value: ir.Value) -> bool:
+        return any(value == dynamic for dynamic in self._dynamic_shared_memory_values)
 
     def _request_shared_memory(self, sizes: tuple[ir.Value, ...], mr_type: ir.MemRefType):
         bytes = self._shared_memory_element_bytes(mr_type)
