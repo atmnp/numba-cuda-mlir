@@ -45,7 +45,12 @@ from numba_cuda_mlir.numba_cuda.core.target_extension import (
     jit_registry,
 )
 from numba_cuda_mlir.type_defs.builtin_types import Namespace
-from numba_cuda_mlir.caching import MLIRCache, NullCache
+from numba_cuda_mlir.caching import (
+    MLIRCache,
+    NullCache,
+    _normalize_option_cache_value,
+    _target_option_key,
+)
 import logging
 import warnings
 import numpy as np
@@ -57,6 +62,69 @@ import pstats
 
 # Thread-local storage for passing original tuple arg types to _compile
 _compile_arg_types = threading.local()
+
+
+class _ObjectIdentityKey:
+    __slots__ = ("obj",)
+
+    def __init__(self, obj):
+        # Keep a strong reference so cached identity keys cannot collide with a
+        # newly allocated object after the original object is removed.
+        self.obj = obj
+
+    def __hash__(self):
+        return id(self.obj)
+
+    def __eq__(self, other):
+        return isinstance(other, _ObjectIdentityKey) and self.obj is other.obj
+
+
+def _compile_option_cache_value(value):
+    return _normalize_option_cache_value(value, _ObjectIdentityKey)
+
+
+def _compile_option_overload_key(argtypes, output, abi_info, targetoptions):
+    return (
+        argtypes,
+        output,
+        _compile_option_cache_value(abi_info),
+        _target_option_key(targetoptions),
+    )
+
+
+def _validate_compile_output_targetoptions(targetoptions, output):
+    if output != "ltoir":
+        return
+
+    lto_explicit = bool(targetoptions.get("_lto_explicit", "lto" in targetoptions))
+    if lto_explicit and targetoptions.get("lto") is False:
+        raise ValueError("Cannot produce LTOIR output with lto=False")
+
+
+def _compile_output_targetoption_updates(targetoptions, output):
+    if output is None:
+        return {}
+
+    updates = {"_compile_output": output}
+    if output == "ltoir":
+        _validate_compile_output_targetoptions(targetoptions, output)
+        updates["lto"] = True
+    return updates
+
+
+def _compile_output_cache_hit_matches(cres, output):
+    if output is None:
+        return True
+
+    metadata = getattr(cres, "metadata", {})
+    targetoptions = metadata.get("targetoptions", {})
+    if targetoptions.get("_compile_output") != output:
+        return False
+    if output == "ltoir":
+        return bool(metadata.get("ltoir"))
+    if output == "ptx":
+        return bool(metadata.get("ptx"))
+    return True
 
 
 def _is_strided_memory_view(arg):
@@ -300,6 +368,7 @@ _CONFIGURE_CACHE_STALE_RETRY_LIMIT = 8
 # Keep this larger than configure()'s cache so any marshaller retained by
 # configure() also has room to keep its native dispatcher entry live.
 _LAUNCH_CONFIG_CACHE_SIZE = _CONFIGURE_CACHE_SIZE * 2
+_COMPILE_OPTION_OVERLOAD_CACHE_SIZE = _CONFIGURE_CACHE_SIZE * 2
 
 
 def _env_int(name, default):
@@ -398,21 +467,6 @@ def _validate_configure_cache_key(cache_key):
 
 def _extensions_use_launch_config(extensions):
     return any(getattr(ext, "uses_launch_config", False) for ext in extensions)
-
-
-class _ObjectIdentityKey:
-    __slots__ = ("obj",)
-
-    def __init__(self, obj):
-        # Keep a strong reference so cached identity keys cannot collide with a
-        # newly allocated extension after the original extension is removed.
-        self.obj = obj
-
-    def __hash__(self):
-        return id(self.obj)
-
-    def __eq__(self, other):
-        return isinstance(other, _ObjectIdentityKey) and self.obj is other.obj
 
 
 class _ArgMarshaller:
@@ -1479,6 +1533,7 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
         self._compiler.pipeline_class = get_compiler_class(targetoptions)
 
         self._launch_config_lock = threading.RLock()
+        self._targetoptions_lock = threading.RLock()
         # Launch-specialized overloads are retained until either recompile() or
         # cache eviction, whichever happens first. Retained marshallers can
         # reinstall their native dispatcher after dispatcher cache eviction, but
@@ -1509,6 +1564,11 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
         self._launch_config_cache_hits = collections.Counter()
         self._launch_config_cache_misses = collections.Counter()
         self._launch_config_cache_notice_emitted = False
+        # Option-specialized compiles can include caller-supplied ABI metadata,
+        # so keep their retained CompileResult wrappers bounded.
+        self._compile_option_overloads = collections.OrderedDict()
+        self._regular_overload_option_keys = {}
+        self._temporary_targetoptions_threadlocal = threading.local()
 
         # Checked by type inferer (numba-cuda's typeinfer.py) to detect self-recursive calls
         self._is_compiling = False
@@ -1609,6 +1669,8 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
         # mutable caches lazily before paths that append or clear them.
         if not hasattr(self, "_launch_config_lock"):
             self._launch_config_lock = threading.RLock()
+        if not hasattr(self, "_targetoptions_lock"):
+            self._targetoptions_lock = threading.RLock()
         if not hasattr(self, "_launch_config_overloads"):
             self._launch_config_overloads = {}
         if not hasattr(self, "_launch_config_dispatchers"):
@@ -1621,6 +1683,14 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
             self._launch_config_cache_hits = collections.Counter()
         if not hasattr(self, "_launch_config_cache_notice_emitted"):
             self._launch_config_cache_notice_emitted = False
+        if not hasattr(self, "_compile_option_overloads"):
+            self._compile_option_overloads = collections.OrderedDict()
+        elif not isinstance(self._compile_option_overloads, collections.OrderedDict):
+            self._compile_option_overloads = collections.OrderedDict(self._compile_option_overloads)
+        if not hasattr(self, "_regular_overload_option_keys"):
+            self._regular_overload_option_keys = {}
+        if not hasattr(self, "_temporary_targetoptions_threadlocal"):
+            self._temporary_targetoptions_threadlocal = threading.local()
         if not hasattr(self, "_old_dispatchers"):
             self._old_dispatchers = []
         if not hasattr(self, "_configure_cache"):
@@ -1629,6 +1699,64 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
             self._configure_cache_inflight = {}
         if "configure" not in self.__dict__:
             self.configure = _ConfigureProxy(self)
+
+    @contextmanager
+    def _temporary_targetoptions(self, updates=None, publish=True):
+        """Temporarily swap target options for compile/cache-key paths.
+
+        The lock intentionally spans cache load/save and the compile itself so
+        per-call option compiles cannot race with regular cache-miss compiles
+        that share the dispatcher's targetoptions-backed cache key. Set
+        ``publish`` to False when the active options can be passed explicitly
+        and only the cache key needs to observe the temporary values.
+        """
+        self._ensure_dispatcher_state()
+        with self._targetoptions_lock:
+            local_depth = getattr(self._temporary_targetoptions_threadlocal, "depth", 0)
+            self._temporary_targetoptions_threadlocal.depth = local_depth + 1
+            try:
+                if not updates:
+                    yield self.targetoptions
+                    return
+                original_targetoptions = self.targetoptions
+                active_targetoptions = original_targetoptions.copy()
+                active_targetoptions.update(updates)
+                cache_had_targetoptions = hasattr(self._cache, "_targetoptions")
+                if cache_had_targetoptions:
+                    original_cache_targetoptions = self._cache._targetoptions
+                try:
+                    if active_targetoptions is not original_targetoptions:
+                        if publish:
+                            self.targetoptions = active_targetoptions
+                        if cache_had_targetoptions:
+                            self._cache._targetoptions = active_targetoptions
+                    yield active_targetoptions
+                finally:
+                    if active_targetoptions is not original_targetoptions:
+                        if publish:
+                            self.targetoptions = original_targetoptions
+                        if cache_had_targetoptions:
+                            self._cache._targetoptions = original_cache_targetoptions
+            finally:
+                if local_depth:
+                    self._temporary_targetoptions_threadlocal.depth = local_depth
+                elif hasattr(self._temporary_targetoptions_threadlocal, "depth"):
+                    delattr(self._temporary_targetoptions_threadlocal, "depth")
+
+    @contextmanager
+    def _temporary_cache_targetoptions(self, targetoptions):
+        """Temporarily install target options for cache key computation."""
+        self._ensure_dispatcher_state()
+        with self._targetoptions_lock:
+            cache_had_targetoptions = hasattr(self._cache, "_targetoptions")
+            if cache_had_targetoptions:
+                original_cache_targetoptions = self._cache._targetoptions
+                self._cache._targetoptions = targetoptions
+            try:
+                yield
+            finally:
+                if cache_had_targetoptions:
+                    self._cache._targetoptions = original_cache_targetoptions
 
     def _clear_configure_cache(self):
         self._ensure_dispatcher_state()
@@ -1926,10 +2054,41 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
         """Enable on-disk caching for this dispatcher."""
         self._cache = MLIRCache(self.py_func, self.targetoptions)
 
-    def _resolve_target_options(self):
+    def _resolve_target_options(self, targetoptions=None):
         from numba_cuda_mlir.tools import resolve_target_options
 
-        resolve_target_options(self.targetoptions)
+        if targetoptions is None:
+            targetoptions = self.targetoptions
+        resolve_target_options(targetoptions)
+
+    def _record_regular_overload(self, argtypes, wrapped, targetoptions):
+        self.overloads[argtypes] = wrapped
+        self._regular_overload_option_keys[argtypes] = _target_option_key(targetoptions)
+
+    def _get_compile_option_overload(self, key):
+        try:
+            wrapped = self._compile_option_overloads[key]
+        except KeyError:
+            return None
+        self._compile_option_overloads.move_to_end(key)
+        return wrapped
+
+    def _record_compile_option_overload(self, key, wrapped):
+        self._compile_option_overloads[key] = wrapped
+        self._compile_option_overloads.move_to_end(key)
+        while len(self._compile_option_overloads) > _COMPILE_OPTION_OVERLOAD_CACHE_SIZE:
+            self._compile_option_overloads.popitem(last=False)
+
+    def _regular_overload_option_key(self, argtypes, wrapped, active_option_key):
+        key = self._regular_overload_option_keys.get(argtypes, _MISSING)
+        if key is not _MISSING:
+            return key
+
+        metadata = getattr(wrapped, "metadata", None)
+        targetoptions = metadata.get("targetoptions") if metadata is not None else None
+        key = _target_option_key(targetoptions) if targetoptions is not None else active_option_key
+        self._regular_overload_option_keys[argtypes] = key
+        return key
 
     @property
     def stats(self):
@@ -2416,6 +2575,15 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
         if active_launch_config_key is not None:
             with self._launch_config_lock:
                 active_launch_config_generation = self._launch_config_generation
+        targetoptions = None
+        active_option_key = None
+        if active_launch_config_key is None:
+            targetoptions = self.targetoptions
+            if has_extension_snapshot:
+                targetoptions = self.targetoptions.copy()
+                targetoptions["extensions"] = active_extensions
+            self._resolve_target_options(targetoptions)
+            active_option_key = _target_option_key(targetoptions)
 
         def _result(cres):
             return (
@@ -2441,7 +2609,11 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
                 if len(sig_args) == len(argtypes) and all(
                     self._can_reuse_overload(s, r) for s, r in zip(sig_args, argtypes)
                 ):
-                    return _result(cres)
+                    existing_key = self._regular_overload_option_key(
+                        sig_args, cres, active_option_key
+                    )
+                    if existing_key == active_option_key:
+                        return _result(cres)
 
         if not self._can_compile:
             if active_launch_config_key is not None:
@@ -2483,21 +2655,29 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
                         f"{generic_note}"
                     )
                 return _result(cres)
-            best, has_any = self._resolve_overload(argtypes, allow_unsafe=True)
+            candidate_overloads = {
+                sig_args: cres
+                for sig_args, cres in self.overloads.items()
+                if self._regular_overload_option_key(sig_args, cres, active_option_key)
+                == active_option_key
+            }
+            best, has_any = self._resolve_overload(
+                argtypes, allow_unsafe=True, candidate_sig_args=tuple(candidate_overloads)
+            )
             if not has_any:
                 raise TypeError(f"No matching definition for argument type(s) {argtypes}")
             if len(best) > 1:
                 self._raise_ambiguous(argtypes, best)
-            cres = self.overloads[best[0]]
+            cres = candidate_overloads[best[0]]
             return _result(cres)
 
-        self._resolve_target_options()
-        targetoptions = self.targetoptions
-        if active_launch_config is not None or has_extension_snapshot:
-            targetoptions = self.targetoptions.copy()
-            if has_extension_snapshot:
-                targetoptions["extensions"] = active_extensions
-            if active_launch_config is not None:
+        if active_launch_config_key is not None:
+            self._resolve_target_options()
+            targetoptions = self.targetoptions
+            if active_launch_config is not None or has_extension_snapshot:
+                targetoptions = self.targetoptions.copy()
+                if has_extension_snapshot:
+                    targetoptions["extensions"] = active_extensions
                 targetoptions["__launch_config__"] = dict(active_launch_config)
 
         # Try to load from disk cache
@@ -2506,12 +2686,16 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
         # Launch-specialized compiles use an in-memory cache because the
         # generic in-memory and on-disk cache keys do not include launch metadata.
         if active_launch_config_key is None:
-            cres = self._cache.load_overload(sig, mlir_target.target_context)
-            if cres is not None:
-                self._cache_hits[argtypes] += 1
-                wrapped = CompileResult(cres)
-                self.overloads[argtypes] = wrapped
-                return _result(wrapped)
+            # Disk cache keys read the cache's target options. Per-call compile
+            # requests temporarily swap those options under this same lock.
+            with self._temporary_cache_targetoptions(targetoptions):
+                cres = self._cache.load_overload(sig, mlir_target.target_context)
+                if cres is not None:
+                    self._cache_hits[argtypes] += 1
+                    wrapped = CompileResult(cres)
+                    self._apply_shared_memory_carveout(wrapped)
+                    self._record_regular_overload(argtypes, wrapped, targetoptions)
+                    return _result(wrapped)
 
         # Cache miss - need to compile
         if active_launch_config_key is None:
@@ -2576,11 +2760,12 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
         else:
             self._propagate_compile_callbacks(result.metadata)
             self._apply_shared_memory_carveout(wrapped)
-            self.overloads[result.signature.args] = wrapped
 
         # Save to disk cache
         if active_launch_config_key is None:
-            self._cache.save_overload(sig, result)
+            with self._temporary_cache_targetoptions(targetoptions):
+                self._record_regular_overload(result.signature.args, wrapped, targetoptions)
+                self._cache.save_overload(sig, result)
 
         return _result(wrapped)
 
@@ -2590,60 +2775,106 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
         from numba_cuda_mlir.compiler import CompileResult
 
         argtypes, return_type = sigutils.normalize_signature(sig)
+        self._ensure_dispatcher_state()
+        temporary_targetoptions_depth = getattr(
+            self._temporary_targetoptions_threadlocal, "depth", 0
+        )
 
-        # Check in-memory overloads first
-        if argtypes in self.overloads:
-            return self.overloads[argtypes]
+        use_regular_overload = (
+            output is None and abi_info is None and not temporary_targetoptions_depth
+        )
+        use_disk_cache = abi_info is None
 
-        self._resolve_target_options()
-
-        # Try to load from disk cache
-        mlir_target.ensure_initialized()
-        cres = self._cache.load_overload(sig, mlir_target.target_context)
-        if cres is not None:
-            self._cache_hits[argtypes] += 1
-            wrapped = CompileResult(cres)
-            self.overloads[argtypes] = wrapped
-            return wrapped
-
-        # Cache miss - need to compile
-        self._cache_misses[argtypes] += 1
-
-        if output is not None:
-            self.targetoptions["output"] = output
+        targetoption_updates = {}
         if abi_info is not None:
-            self.targetoptions["abi_info"] = abi_info
+            targetoption_updates["abi_info"] = abi_info
+        if output is not None:
+            targetoption_updates.update(
+                _compile_output_targetoption_updates(self.targetoptions, output)
+            )
 
-        self._is_compiling = True
-        try:
-            with self._compile_profiler():
-                cres = mlir_compiler.compile_mlir(
-                    self.py_func,
-                    return_type,
-                    argtypes,
-                    targetoptions=self.targetoptions,
+        # Keep the active cache-key options installed through load/save and
+        # compile so cache hits and stored metadata reflect the same options.
+        with self._temporary_targetoptions(
+            targetoption_updates, publish=False
+        ) as active_targetoptions:
+            self._resolve_target_options(active_targetoptions)
+            active_option_key = _target_option_key(active_targetoptions)
+            # Per-call output and ABI requests are compilation products, not
+            # launch overloads, so only the regular compile path can reuse the
+            # generic overload table.
+            if use_regular_overload and argtypes in self.overloads:
+                existing = self.overloads[argtypes]
+                existing_key = self._regular_overload_option_key(
+                    argtypes, existing, active_option_key
                 )
-                optimize(cres)
+                if existing_key == active_option_key:
+                    return existing
+            option_overload_key = None
+            if not use_regular_overload:
+                self._ensure_dispatcher_state()
+                option_overload_key = _compile_option_overload_key(
+                    argtypes, output, abi_info, active_targetoptions
+                )
+                option_overload = self._get_compile_option_overload(option_overload_key)
+                if option_overload is not None:
+                    return option_overload
 
-            cres.target_context.insert_user_function(cres.entry_point, cres.fndesc, [cres.library])
-        finally:
-            self._is_compiling = False
+            mlir_target.ensure_initialized()
+            if use_disk_cache:
+                # Try to load from disk cache
+                cres = self._cache.load_overload(sig, mlir_target.target_context)
+                if cres is not None and _compile_output_cache_hit_matches(cres, output):
+                    self._cache_hits[argtypes] += 1
+                    wrapped = CompileResult(cres)
+                    self._apply_shared_memory_carveout(wrapped)
+                    if use_regular_overload:
+                        self.overloads[argtypes] = wrapped
+                        self._regular_overload_option_keys[argtypes] = active_option_key
+                    elif option_overload_key is not None:
+                        self._record_compile_option_overload(option_overload_key, wrapped)
+                    return wrapped
 
-        # Propagate callbacks discovered during lowering/optimization
-        self._propagate_compile_callbacks(cres.metadata)
+            # Cache miss - need to compile
+            self._cache_misses[argtypes] += 1
 
-        # Save to cache
-        self._cache.save_overload(sig, cres)
+            self._is_compiling = True
+            try:
+                with self._compile_profiler():
+                    cres = mlir_compiler.compile_mlir(
+                        self.py_func,
+                        return_type,
+                        argtypes,
+                        targetoptions=active_targetoptions,
+                    )
+                    optimize(cres)
 
-        # Wrap in CompileResult for compatibility attributes
-        wrapped = CompileResult(cres)
+                cres.target_context.insert_user_function(
+                    cres.entry_point, cres.fndesc, [cres.library]
+                )
+            finally:
+                self._is_compiling = False
 
-        self._apply_shared_memory_carveout(wrapped)
+            # Propagate callbacks discovered during lowering/optimization
+            self._propagate_compile_callbacks(cres.metadata)
 
-        # Store in overloads
-        self.overloads[argtypes] = wrapped
+            if use_disk_cache:
+                # Save to cache
+                self._cache.save_overload(sig, cres)
 
-        return wrapped
+            # Wrap in CompileResult for compatibility attributes
+            wrapped = CompileResult(cres)
+
+            self._apply_shared_memory_carveout(wrapped)
+
+            # Store in overloads
+            if use_regular_overload:
+                self.overloads[argtypes] = wrapped
+                self._regular_overload_option_keys[argtypes] = active_option_key
+            elif option_overload_key is not None:
+                self._record_compile_option_overload(option_overload_key, wrapped)
+
+            return wrapped
 
     def compile_for(self, *args):
         return_type = types.none
@@ -2699,9 +2930,10 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
         opts = self.targetoptions.copy()
         opts["device"] = True
         opts["lto"] = False
-        opts["output"] = "ptx"
+        opts.pop("_compile_output", None)
         if self.targetoptions.get("device", False):
             self.targetoptions.update(opts)
+            self.targetoptions.pop("_compile_output", None)
             return self._compile_device_callee(sig)
 
         if not hasattr(self, "_device_dispatcher") or self._device_dispatcher.targetoptions != opts:
@@ -2859,9 +3091,10 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
         opts = self.targetoptions.copy()
         opts["device"] = True
         opts["lto"] = False
-        opts["output"] = "ptx"
+        opts.pop("_compile_output", None)
         if self.targetoptions.get("device", False):
             self.targetoptions.update(opts)
+            self.targetoptions.pop("_compile_output", None)
             return self.compile(sig)
         if not hasattr(self, "_device_dispatcher") or self._device_dispatcher.targetoptions != opts:
             self._device_dispatcher = MLIRDispatcher(self.py_func, targetoptions=opts)
@@ -2897,6 +3130,8 @@ class MLIRDispatcher(Dispatcher, serialize.ReduceMixin):
 
         # Clear Python-side overloads
         self.overloads.clear()
+        self._compile_option_overloads.clear()
+        self._regular_overload_option_keys.clear()
 
         # Clear cache counters
         self._cache_hits.clear()

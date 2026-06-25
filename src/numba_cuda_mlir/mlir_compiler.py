@@ -317,11 +317,10 @@ def compile_mlir(pyfunc, return_type, args, targetoptions: Dict[str, Any]):
 
     flags.auto_parallel = ParallelOptions(targetoptions.get("parallel", False))
     flags.nvvm_options = {}
-    # Implicit LTO for external link items is handled after lowering, when the
-    # complete link set is known. Only explicit LTO requests compile this
-    # frontend output directly as LTOIR. Frontends are expected to populate
-    # _lto_explicit; the fallback preserves older direct calls into this layer.
-    is_lto = targetoptions.get("output", "ptx") == "ltoir" or (
+    # This front-end flag only tracks explicit LTO or an explicitly requested
+    # LTOIR artifact. Implicit JIT link-item LTO is resolved later by
+    # resolve_link_plan()/optimize(), where the complete link-item set exists.
+    is_lto = targetoptions.get("_compile_output") == "ltoir" or (
         targetoptions.get("_lto_explicit", "lto" in targetoptions)
         and targetoptions.get("lto", False)
     )

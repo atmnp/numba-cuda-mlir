@@ -12,7 +12,6 @@ import inspect
 import sys
 from textwrap import dedent
 from dataclasses import dataclass
-from numba_cuda_mlir.linker import _link_item_is_cuda_source, _link_item_is_ltoir
 from numba_cuda_mlir.tools import format_arch
 
 
@@ -332,13 +331,6 @@ def _get_schema() -> tuple[MLIRJITOption, ...]:
             hidden=True,
         ),
         MLIRJITOption(
-            name="output",
-            types=str,
-            default_value="ptx",
-            help="Output format for compile functions",
-            hidden=True,
-        ),
-        MLIRJITOption(
             name="_dbg_optnone",
             types=bool,
             default_value=False,
@@ -486,22 +478,6 @@ def _get_signatures(func_or_sig):
         raise ValueError(_target_options_help(f"Invalid function or signature: {func_or_sig}."))
 
 
-def _link_items_have_callbacks(link_items) -> bool:
-    return any(
-        bool(getattr(link_item, "setup_callback", None))
-        or bool(getattr(link_item, "teardown_callback", None))
-        for link_item in link_items
-    )
-
-
-def _link_items_have_ltoir(link_items) -> bool:
-    return any(_link_item_is_ltoir(link_item) for link_item in link_items)
-
-
-def _link_items_have_cuda_source(link_items) -> bool:
-    return any(_link_item_is_cuda_source(link_item) for link_item in link_items)
-
-
 def verify_target_options(kws: dict[str, Any]) -> dict[str, Any]:
     targetoptions = kws.copy()
 
@@ -558,31 +534,9 @@ def verify_target_options(kws: dict[str, Any]) -> dict[str, Any]:
             targetoptions["chip"] = format_arch(cc)
 
     lto_was_explicit = "lto" in kws
-    output_was_explicit = "output" in kws
-    link_items = targetoptions.get("link", [])
-    link_items_have_ltoir = _link_items_have_ltoir(link_items)
-    link_items_have_cuda_source = _link_items_have_cuda_source(link_items)
-    if targetoptions.get("lto") is None and output_was_explicit:
-        targetoptions["lto"] = targetoptions["output"] == "ltoir"
-    elif targetoptions.get("lto") is None and _link_items_have_callbacks(link_items):
+    if targetoptions.get("lto") is None:
         targetoptions["lto"] = False
-    elif (
-        targetoptions.get("lto") is None
-        and (link_items_have_ltoir or link_items_have_cuda_source)
-        and not targetoptions.get("debug")
-    ):
-        from numba_cuda_mlir.numba_cuda.cudadrv.driver import _have_nvjitlink
-
-        targetoptions["lto"] = _have_nvjitlink()
-    elif targetoptions.get("lto") is None:
-        targetoptions["lto"] = False
-    if targetoptions.get("lto") is False:
-        if output_was_explicit and targetoptions["output"] == "ltoir":
-            raise ValueError('output="ltoir" requires LTO; leave lto unset or set lto=True.')
-        if link_items_have_ltoir:
-            raise ValueError("LTOIR link inputs require LTO; leave lto unset or set lto=True.")
     targetoptions["_lto_explicit"] = lto_was_explicit
-    targetoptions["_output_explicit"] = output_was_explicit
 
     return targetoptions
 

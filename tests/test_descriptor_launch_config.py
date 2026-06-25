@@ -67,6 +67,19 @@ class _CompileResult:
         self.metadata = {"ptx": ptx}
 
 
+class _RecordingLock:
+    def __init__(self):
+        self.depth = 0
+
+    def __enter__(self):
+        self.depth += 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.depth -= 1
+        return False
+
+
 @pytest.fixture(autouse=True)
 def restore_compile_arg_types():
     # The launch metadata thread-local is only mutated from the test thread in
@@ -451,6 +464,152 @@ def test_compile_impl_generic_applies_shared_memory_carveout(monkeypatch):
     assert dispatcher._compile_impl([1]) == (b"generic", "kernel", False)
     assert len(applied) == 1
     assert dispatcher.overloads[(types.int32,)] is applied[0]
+
+
+def test_compile_impl_disk_cache_hit_applies_shared_memory_carveout(monkeypatch):
+    def kernel(x):
+        pass
+
+    class CachedResult:
+        signature = cuda_typing.signature(types.none, types.int32)
+        metadata = {"cubin": b"cached", "func_name": "kernel"}
+
+    class LoadingCache:
+        def __init__(self, targetoptions):
+            self._targetoptions = targetoptions
+
+        def load_overload(self, sig, target_context):
+            return CachedResult()
+
+        def save_overload(self, sig, result):
+            raise AssertionError("cache hit should not save")
+
+    dispatcher = descriptor_mod.MLIRDispatcher(
+        kernel, targetoptions={"shared_memory_carveout": "maxshared"}
+    )
+    applied = []
+    dispatcher._cache = LoadingCache(dispatcher.targetoptions)
+    monkeypatch.setattr(
+        dispatcher,
+        "_apply_shared_memory_carveout",
+        lambda wrapped: applied.append(wrapped),
+    )
+
+    descriptor_mod._compile_arg_types.types = (types.int32,)
+
+    assert dispatcher._compile_impl([1]) == (b"cached", "kernel", False)
+    assert len(applied) == 1
+    assert dispatcher.overloads[(types.int32,)] is applied[0]
+
+
+def test_compile_impl_generic_overload_cache_includes_targetoptions(monkeypatch):
+    from numba_cuda_mlir import mlir_compiler
+
+    def kernel(x):
+        pass
+
+    dispatcher = descriptor_mod.MLIRDispatcher(kernel)
+    compile_calls = []
+
+    class CompilerResult:
+        def __init__(self, cubin, targetoptions):
+            self.signature = cuda_typing.signature(types.none, types.int32)
+            self.metadata = {
+                "cubin": cubin,
+                "func_name": "kernel",
+                "targetoptions": dict(targetoptions),
+            }
+
+    def mlir_compiler_entry(pyfunc, func_args, targetoptions, override_argtypes):
+        compile_calls.append(dict(targetoptions))
+        return CompilerResult(f"cubin-{len(compile_calls)}".encode(), targetoptions)
+
+    monkeypatch.setattr(mlir_compiler, "mlir_compiler_entry", mlir_compiler_entry)
+    descriptor_mod._compile_arg_types.types = (types.int32,)
+
+    assert dispatcher._compile_impl([1]) == (b"cubin-1", "kernel", False)
+    dispatcher.targetoptions["fastmath"] = True
+    assert dispatcher._compile_impl([1]) == (b"cubin-2", "kernel", False)
+
+    assert len(compile_calls) == 2
+    assert compile_calls[0].get("fastmath") is None
+    assert compile_calls[1]["fastmath"] is True
+
+
+def test_compile_impl_non_launch_extension_snapshot_uses_resolved_targetoptions(
+    monkeypatch,
+):
+    from numba_cuda_mlir import mlir_compiler
+
+    def kernel(x):
+        pass
+
+    extension = _NonLaunchConfigExtension()
+    other_extension = _NonLaunchConfigExtension()
+    dispatcher = descriptor_mod.MLIRDispatcher(kernel)
+    compile_calls = []
+    cache_observations = []
+
+    class RecordingCache:
+        def __init__(self, targetoptions):
+            self._targetoptions = targetoptions
+
+        def load_overload(self, sig, target_context):
+            cache_observations.append(("load", self._targetoptions, dict(self._targetoptions)))
+            return None
+
+        def save_overload(self, sig, result):
+            cache_observations.append(("save", self._targetoptions, dict(self._targetoptions)))
+
+    class CompilerResult:
+        def __init__(self, cubin):
+            self.signature = cuda_typing.signature(types.none, types.int32)
+            self.metadata = {"cubin": cubin, "func_name": "kernel"}
+
+    def resolve_target_options(self, targetoptions=None):
+        if targetoptions is None:
+            targetoptions = self.targetoptions
+        targetoptions["opt_level"] = 3
+
+    def mlir_compiler_entry(pyfunc, func_args, targetoptions, override_argtypes):
+        compile_calls.append(dict(targetoptions))
+        return CompilerResult(f"cubin-{len(compile_calls)}".encode())
+
+    monkeypatch.setattr(
+        descriptor_mod.MLIRDispatcher,
+        "_resolve_target_options",
+        resolve_target_options,
+    )
+    monkeypatch.setattr(mlir_compiler, "mlir_compiler_entry", mlir_compiler_entry)
+    dispatcher._cache = RecordingCache(dispatcher.targetoptions)
+    descriptor_mod._compile_arg_types.types = (types.int32,)
+    descriptor_mod._compile_arg_types.extensions = [extension]
+
+    assert dispatcher._compile_impl([1]) == (b"cubin-1", "kernel", False)
+    assert dispatcher._compile_impl([1]) == (b"cubin-1", "kernel", False)
+    descriptor_mod._compile_arg_types.extensions = [other_extension]
+    assert dispatcher._compile_impl([1]) == (b"cubin-2", "kernel", False)
+
+    assert len(compile_calls) == 2
+    assert compile_calls[0]["extensions"] == [extension]
+    assert compile_calls[0]["opt_level"] == 3
+    assert compile_calls[1]["extensions"] == [other_extension]
+    assert compile_calls[1]["opt_level"] == 3
+    assert [observation[0] for observation in cache_observations] == [
+        "load",
+        "save",
+        "load",
+        "save",
+    ]
+    assert cache_observations[0][1] is cache_observations[1][1]
+    assert cache_observations[2][1] is cache_observations[3][1]
+    assert cache_observations[0][1] is not dispatcher.targetoptions
+    assert cache_observations[2][1] is not dispatcher.targetoptions
+    assert cache_observations[0][2]["extensions"] == [extension]
+    assert cache_observations[0][2]["opt_level"] == 3
+    assert cache_observations[2][2]["extensions"] == [other_extension]
+    assert cache_observations[2][2]["opt_level"] == 3
+    assert dispatcher._cache._targetoptions is dispatcher.targetoptions
 
 
 def test_launch_config_key_validation():
@@ -1413,6 +1572,47 @@ def test_compile_impl_launch_config_publishes_aliases_and_skips_disk_cache(monke
         "Persistent disk cache is disabled for launch-config-specialized "
         "compiles because the disk cache key does not include launch metadata."
     ]
+
+
+def test_compile_impl_disk_cache_uses_targetoptions_lock(monkeypatch):
+    from numba_cuda_mlir import mlir_compiler
+
+    def kernel(x):
+        pass
+
+    class RecordingCache:
+        def __init__(self, lock):
+            self.lock = lock
+            self.load_depth = None
+            self.save_depth = None
+
+        def load_overload(self, sig, target_context):
+            self.load_depth = self.lock.depth
+            return None
+
+        def save_overload(self, sig, result):
+            self.save_depth = self.lock.depth
+
+    class CompilerResult:
+        signature = cuda_typing.signature(types.none, types.int32)
+        metadata = {"cubin": b"cubin", "func_name": "kernel"}
+
+    def mlir_compiler_entry(pyfunc, func_args, targetoptions, override_argtypes):
+        return CompilerResult()
+
+    dispatcher = descriptor_mod.MLIRDispatcher(kernel)
+    lock = _RecordingLock()
+    cache = RecordingCache(lock)
+    dispatcher._targetoptions_lock = lock
+    dispatcher._cache = cache
+    monkeypatch.setattr(mlir_compiler, "mlir_compiler_entry", mlir_compiler_entry)
+    descriptor_mod._compile_arg_types.types = (types.int32,)
+
+    assert dispatcher._compile_impl([1]) == (b"cubin", "kernel", False)
+
+    assert cache.load_depth == 1
+    assert cache.save_depth == 1
+    assert lock.depth == 0
 
 
 def test_compile_impl_launch_config_separates_same_signature_by_grid(monkeypatch):

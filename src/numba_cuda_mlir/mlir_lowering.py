@@ -77,7 +77,7 @@ from numba_cuda_mlir.tools import (
     get_max_ptx_version,
     resolve_gpu_target,
 )
-from numba_cuda_mlir.linker import Linker, _link_item_is_cuda_source, _link_item_is_ltoir
+from numba_cuda_mlir.linker import Linker, resolve_link_plan
 from numba_cuda_mlir.memory_management.nrt_mlir import emit_nrt_functions
 from numba_cuda_mlir.nrt_context import MLIRNRTContext
 from numba_cuda_mlir.type_defs.aggregate_types import AggregateType, UnionType
@@ -148,15 +148,6 @@ class MLIRLower(object):
         linker_arch = gpu_target["linker_arch"]
 
         link_files = list(self.targetoptions.get("link", []))
-        has_ltoir_files = any(
-            (f.endswith(".ltoir") if isinstance(f, str) else type(f).__name__ == "LTOIR")
-            for f in link_files
-        )
-        needs_lto = (
-            self.targetoptions.get("lto", False)
-            or has_ltoir_files
-            or self.targetoptions.get("output", "ptx") == "ltoir"
-        )
 
         self._debug_full = self.targetoptions.get("debug", False)
         self._line_only = self.targetoptions.get("lineinfo", False)
@@ -169,14 +160,14 @@ class MLIRLower(object):
             debug=self._debug_full,
             lineinfo=self._line_only,
             ptxas_options=self.targetoptions.get("ptxas_options", None),
-            lto=needs_lto,
             max_registers=self.targetoptions.get("max_registers", None),
         )
         self._seen_mlir_libraries = set()
         self._cloned_device_funcs: set[str] = set()
         self._linked_external_items = set()
         self._linked_external_link_items = []
-        self.linker = self._create_linker()
+        self._linked_ltoirs = []
+        self._linked_ltoir_keys = set()
 
         # Collect module callbacks from LinkableCode objects (e.g. CUSource)
         # for invocation after the CUlibrary is loaded by C++.
@@ -250,11 +241,37 @@ class MLIRLower(object):
         #  - environment: the python execution environment
         self.context = context.subtarget(environment=self.env, fndesc=self.fndesc)
 
-    def _create_linker(self):
+    def _create_linker(self, link_plan):
         return Linker(
             **self._linker_config,
+            lto=link_plan.linker_uses_lto,
             optimize_unused_variables=True,
         )
+
+    def _create_resolved_linker(self):
+        link_plan = resolve_link_plan(
+            self.targetoptions,
+            self._linked_external_link_items,
+            self._linked_ltoirs,
+        )
+        linker = self._create_linker(link_plan)
+        for link_item in self._linked_external_link_items:
+            linker.add_file_guess_ext(
+                link_item, compile_cu_as_ltoir=link_plan.compile_cuda_sources_as_ltoir
+            )
+        for ltoir in self._linked_ltoirs:
+            linker.add_ltoir(ltoir)
+        self.metadata["link_plan"] = link_plan
+        self.metadata["linked_external_link_items"] = tuple(self._linked_external_link_items)
+        self.metadata["external_link_items"] = list(self._linked_external_link_items)
+        return linker
+
+    def _record_ltoirs_from_linker(self, linker):
+        for ltoir in linker._ltoirs:
+            if ltoir in self._linked_ltoir_keys:
+                continue
+            self._linked_ltoir_keys.add(ltoir)
+            self._linked_ltoirs.append(ltoir)
 
     def _collect_poly_dbg_types(self):
         """Scan function body to collect polymorphic debug types."""
@@ -344,7 +361,7 @@ class MLIRLower(object):
                 assert self.metadata
                 self.metadata["mlir_module"] = self.mlir_module
                 self.metadata["_mlir_has_debug_info"] = self._di_subprogram is not None
-                self.metadata["linker"] = self.linker
+                self.metadata["linker"] = self._create_resolved_linker()
                 self.metadata["needs_nrt"] = needs_nrt
                 self.metadata["nrt_inline"] = needs_nrt
                 if self._setup_callbacks or self._teardown_callbacks:
@@ -1659,7 +1676,7 @@ extern "C" __global__ void
         cres = fn._compile_as_device_callee(folded_argtypes)
 
         if callee_linker := cres.metadata.get("linker"):
-            self.linker.merge_ltoirs_from(callee_linker)
+            self._record_ltoirs_from_linker(callee_linker)
 
         module: ir.Module = ir.Module.parse(get_mlir_module_str(cres.metadata))
         gpu_module: gpu.GPUModuleOp = list(module.body)[0]
@@ -1862,7 +1879,7 @@ extern "C" __global__ void
         cres = cuda_func.compile(folded_argtypes, abi_info={"abi_name": func_name})
 
         if callee_linker := cres.metadata.get("linker"):
-            self.linker.merge_ltoirs_from(callee_linker)
+            self._record_ltoirs_from_linker(callee_linker)
 
         link.link_inplace(self.mlir_module, get_mlir_module_str(cres.metadata))
 
@@ -2018,7 +2035,7 @@ extern "C" __global__ void
             self.link_external_item(link_item)
 
     def link_external_item(self, link_item):
-        """Register an external code object with the active linker."""
+        """Register an external code object to link after lowering."""
         key = self._external_link_item_key(link_item)
         if key in self._linked_external_items:
             return
@@ -2028,55 +2045,13 @@ extern "C" __global__ void
         has_teardown_callback = (
             hasattr(link_item, "teardown_callback") and link_item.teardown_callback
         )
-        link_item_is_ltoir = _link_item_is_ltoir(link_item)
-        if (
-            (has_setup_callback or has_teardown_callback)
-            and not self.targetoptions.get("_lto_explicit", False)
-            and not self.targetoptions.get("_output_explicit", False)
-        ):
-            self.targetoptions["lto"] = False
-            self.targetoptions["output"] = "ptx"
-            if self._linker_config["lto"]:
-                self._linker_config["lto"] = False
-                self.linker = self._create_linker()
-                for prior_link_item in self._linked_external_link_items:
-                    self.linker.add_file_guess_ext(prior_link_item)
-        elif self._can_enable_implicit_lto_for_external_link_item(link_item):
-            self.targetoptions["lto"] = True
-            if not self._linker_config["lto"]:
-                self._linker_config["lto"] = True
-                self.linker = self._create_linker()
-                for prior_link_item in self._linked_external_link_items:
-                    self.linker.add_file_guess_ext(prior_link_item)
-
-        if link_item_is_ltoir and not self._linker_config["lto"]:
-            raise ValueError("LTOIR link inputs require LTO; leave lto unset or set lto=True.")
-
         if has_setup_callback:
             self._setup_callbacks.append(link_item.setup_callback)
         if has_teardown_callback:
             self._teardown_callbacks.append(link_item.teardown_callback)
-        self.linker.add_file_guess_ext(link_item)
         self._linked_external_link_items.append(link_item)
         self.metadata["external_link_items"] = list(self._linked_external_link_items)
-
-    def _can_enable_implicit_lto_for_external_link_item(self, link_item) -> bool:
-        if not (_link_item_is_ltoir(link_item) or _link_item_is_cuda_source(link_item)):
-            return False
-        if self.targetoptions.get("lto", False):
-            return False
-        if self.targetoptions.get("_lto_explicit", False):
-            return False
-        if self.targetoptions.get("_output_explicit", False):
-            return False
-        if self._setup_callbacks or self._teardown_callbacks:
-            return False
-        if self.targetoptions.get("debug"):
-            return False
-
-        from numba_cuda_mlir.numba_cuda.cudadrv.driver import _have_nvjitlink
-
-        return _have_nvjitlink()
+        self.metadata["linked_external_link_items"] = tuple(self._linked_external_link_items)
 
     @staticmethod
     def _external_link_item_key(link_item):

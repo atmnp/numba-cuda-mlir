@@ -646,6 +646,25 @@ def _compile_ltoir_for_inspection(cres, target_options) -> bytes:
     return ltoir
 
 
+def _cu_ltoir_mode(link_plan):
+    if link_plan is None:
+        return None
+    compile_cu_as_ltoir = getattr(link_plan, "compile_cuda_sources_as_ltoir", None)
+    if compile_cu_as_ltoir is None:
+        compile_cu_as_ltoir = getattr(link_plan, "compile_new_inputs_as_ltoir", False)
+    return compile_cu_as_ltoir
+
+
+def _link_item_materialized_as_ltoir(link_item, link_plan) -> bool:
+    from numba_cuda_mlir.linker import _link_item_is_cuda_source, _link_item_is_ltoir
+
+    if _link_item_is_ltoir(link_item):
+        return True
+    if not _link_item_is_cuda_source(link_item):
+        return False
+    return bool(_cu_ltoir_mode(link_plan))
+
+
 def _dump_module(mod, header):
     print(header, end="\n\n")
     # Include loc and #llvm.di_* when present (e.g. debug/lineinfo).
@@ -769,10 +788,10 @@ def get_lto_ptx(cres, linker=None, target_options=None) -> str:
         return ptx
     if target_options is None:
         target_options = cres.metadata["targetoptions"]
-    created_linker = False
     if linker is None:
         linker = cres.metadata.get("linker")
-    if linker is None:
+    created_linker = linker is None
+    if created_linker:
         from numba_cuda_mlir.linker import Linker
         from numba_cuda_mlir.tools import get_gpu_compute_capability, parse_compute_capability
 
@@ -799,17 +818,36 @@ def get_lto_ptx(cres, linker=None, target_options=None) -> str:
             ptxas_options=target_options.get("ptxas_options", None),
             max_registers=target_options.get("max_registers", None),
         )
-        created_linker = True
 
-    replay_link_items = created_linker or not getattr(linker, "lto", False)
     diag_linker = linker.recreate_with_lto(lto=True, ltoir_only=True)
     diag_linker.additional_flags = ["-ptx"]
     diag_linker.add_ltoir(_compile_ltoir_for_inspection(cres, target_options))
-    link_items = cres.metadata.get("external_link_items")
+    link_items = cres.metadata.get("linked_external_link_items")
+    if link_items is None:
+        link_items = cres.metadata.get("external_link_items")
     if link_items is None:
         link_items = target_options.get("link", [])
-    for link_file in link_items if replay_link_items else ():
-        diag_linker.add_file_guess_ext(link_file, ignore_nonlto=True)
+    link_plan = cres.metadata.get("link_plan")
+    from numba_cuda_mlir.linker import _link_item_is_cuda_source
+
+    # A newly created diagnostic linker has not materialized any decorator or
+    # discovered link items, so replay all of them. Only skip materialized
+    # LTOIR inputs when recreating from linker state that already carries them.
+    skip_materialized_link_items = not created_linker
+    for link_file in link_items:
+        if skip_materialized_link_items and _link_item_materialized_as_ltoir(link_file, link_plan):
+            continue
+        compile_cu_as_ltoir = _cu_ltoir_mode(link_plan)
+        if compile_cu_as_ltoir is False and _link_item_is_cuda_source(link_file):
+            continue
+        if compile_cu_as_ltoir is None:
+            diag_linker.add_file_guess_ext(link_file, ignore_nonlto=True)
+        else:
+            diag_linker.add_file_guess_ext(
+                link_file,
+                compile_cu_as_ltoir=compile_cu_as_ltoir,
+                ignore_nonlto=True,
+            )
     if cres.metadata.get("needs_nrt") and not cres.metadata.get("nrt_inline"):
         _maybe_link_nrt(diag_linker)
     return diag_linker.get_linked_ptx().decode("utf-8")
@@ -825,7 +863,26 @@ def _dump_lto_assembly(cres, linker, target_options):
     print("=" * 80)
 
 
+def _fresh_linker_for_optimize(cres, linker_uses_lto):
+    """Return a clean linker for this optimize attempt.
+
+    ``optimize`` mutates the linker by adding the current module artifact before
+    linking. Keep a base linker so retries after failures do not inherit stale
+    LTOIR/PTX inputs from earlier attempts.
+    """
+    base_linker = cres.metadata.setdefault("_optimize_base_linker", cres.metadata["linker"])
+    linker = base_linker.recreate_with_lto(lto=linker_uses_lto)
+    cres.metadata["linker"] = linker
+    return linker
+
+
 def optimize(cres):
+    if cres.metadata.get("_optimization_complete"):
+        # Already-linked or cache-rebuilt results do not retain the lowering
+        # state needed to replay diagnostic assembly dumps; emit those only
+        # during fresh optimization.
+        return
+
     with context.get_context():
         target_options = cres.metadata["targetoptions"]
         dump_mlir = target_options.get("dump_mlir", False) or target_options.get("dump", False)
@@ -870,7 +927,15 @@ def optimize(cres):
 
             chip = get_gpu_compute_capability()
         cc = chip.replace("sm_", "")
-        is_lto = target_options.get("lto", False) or target_options.get("output", "ptx") == "ltoir"
+        link_plan = cres.metadata.get("link_plan")
+        if link_plan is not None:
+            compile_new_inputs_as_ltoir = link_plan.compile_new_inputs_as_ltoir
+            linker_uses_lto = link_plan.linker_uses_lto
+        else:
+            compile_new_inputs_as_ltoir = target_options.get("lto", False) or (
+                target_options.get("_compile_output", "ptx") == "ltoir"
+            )
+            linker_uses_lto = compile_new_inputs_as_ltoir
 
         from numba_cuda_mlir.numba_cuda.cudadrv.nvvm import LibDevice
 
@@ -884,7 +949,7 @@ def optimize(cres):
             neutralize_debug_info_version = _needs_debug_info_version_flag_neutralization(
                 cres,
                 target_options,
-                is_lto,
+                linker_uses_lto,
             )
             llvm_ir = _prepare_llvm_ir(
                 module,
@@ -894,9 +959,9 @@ def optimize(cres):
                 neutralize_debug_info_version_flag=neutralize_debug_info_version,
             )
 
-        linker = cres.metadata["linker"].recreate_with_lto()
+        linker = _fresh_linker_for_optimize(cres, linker_uses_lto)
 
-        if is_lto:
+        if compile_new_inputs_as_ltoir:
             if use_llvm70:
                 ltoir = _call_llvm70_capi(module, target_options, gen_lto=True)
             else:
@@ -921,8 +986,9 @@ def optimize(cres):
         _root_linker_entry_kernel(linker, func_name)
         code = linker.complete()
         cres.metadata["cubin"] = code.code
+        cres.metadata["_optimization_complete"] = target_options.get("_compile_output") is None
 
-        if is_lto:
+        if linker_uses_lto:
             from numba_cuda_mlir.numba_cuda import config
 
             if config.DUMP_ASSEMBLY:

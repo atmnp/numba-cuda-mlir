@@ -49,7 +49,8 @@ llvm::Expected<std::string> llvm70::translateToNVVMIR(gpu::GPUModuleOp gpuMod,
   }
 
   MLIRToLLVM70 translator(*builder);
-  if (auto err = translator.translate(gpuMod, opts.debugLevel, nvvmIRVersion))
+  if (auto err =
+          translator.translate(gpuMod, opts.debugLevel, nvvmIRVersion, opts.genLTO))
     return std::move(err);
 
   return builder->printModuleToString();
@@ -75,7 +76,8 @@ llvm::Expected<std::string> llvm70::translateToPTX(gpu::GPUModuleOp gpuMod,
     return versionOrErr.takeError();
 
   MLIRToLLVM70 translator(*builder);
-  if (auto err = translator.translate(gpuMod, opts.debugLevel, *versionOrErr))
+  if (auto err =
+          translator.translate(gpuMod, opts.debugLevel, *versionOrErr, opts.genLTO))
     return std::move(err);
 
   LLVM_DEBUG({
@@ -282,7 +284,8 @@ void MLIRToLLVM70::setDebugLocFromOp(Operation *op) {
 //===----------------------------------------------------------------------===//
 
 llvm::Error MLIRToLLVM70::translate(gpu::GPUModuleOp gpuMod, int debugLevel,
-                                    NVVMIRVersion nvvmIRVersion) {
+                                    NVVMIRVersion nvvmIRVersion,
+                                    bool omitDebugInfoVersionFlag) {
   bool needFullDebug = (debugLevel >= 2);
   if (debugLevel > 0) {
     // Upgrade to FullDebug when the IR contains debug variable intrinsics
@@ -358,12 +361,15 @@ llvm::Error MLIRToLLVM70::translate(gpu::GPUModuleOp gpuMod, int debugLevel,
 
   if (diCompileUnit) {
     b.finalizeDebugInfo();
-    // Match NVRTC's Error behavior so nvJitLink can merge this module flag
-    // when LLVM70-generated LTOIR is linked with CUDA-source LTOIR.
-    LLVMValueRef flagVals[3] = {b.constInt(b.i32Ty(), 1, false),
-                                b.mdString("Debug Info Version", 18),
-                                b.constInt(b.i32Ty(), 3, false)};
-    b.addNamedMetadataOperand("llvm.module.flags", b.mdNode(flagVals, 3));
+    // libnvvm accepts lineinfo/debug metadata in LLVM70 LTOIR, but nvJitLink
+    // cannot combine that LTOIR with NVRTC LTOIR if this module flag is present.
+    // Keep the metadata and omit only this flag for LTOIR.
+    if (!omitDebugInfoVersionFlag) {
+      LLVMValueRef flagVals[3] = {b.constInt(b.i32Ty(), 1, false),
+                                  b.mdString("Debug Info Version", 18),
+                                  b.constInt(b.i32Ty(), 3, false)};
+      b.addNamedMetadataOperand("llvm.module.flags", b.mdNode(flagVals, 3));
+    }
   }
 
   // Emit the NVVM IR version expected by the active libnvvm. When debug

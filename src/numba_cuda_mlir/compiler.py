@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-from numba_cuda_mlir.descriptor import MLIRDispatcher
+from numba_cuda_mlir.descriptor import (
+    MLIRDispatcher,
+    _validate_compile_output_targetoptions,
+)
 from numba_cuda_mlir.lowering_utilities.type_conversions import to_numba_type
 import inspect
 from typing import Callable, Any, TypeVar
@@ -14,7 +17,6 @@ from numba_cuda_mlir.numba_cuda.typing.templates import (
 from numba_cuda_mlir.numba_cuda.typing.typeof import typeof_impl
 from numba_cuda_mlir.numba_cuda.core.imputils import lower_builtin
 from pathlib import Path
-from numba_cuda_mlir.mlir_optimization import optimize
 from numba_cuda_mlir.numba_cuda.codegen import ExternalCodeLibrary
 from numba_cuda_mlir.numba_cuda.compiler import sigutils
 from numba_cuda_mlir.descriptor import mlir_target
@@ -300,32 +302,65 @@ def _compile_only(pyfunc, sig=None, targetoptions=None):
 def _compile(pyfunc, sig=None, targetoptions=None, optimized=True):
     from numba_cuda_mlir.cuda import jit
 
+    def compile_dispatcher(dispatcher, sig, abi_info=None, output=None):
+        cres = dispatcher.compile(sig, abi_info=abi_info, output=output)
+        return CompileResult(cres)
+
+    def compile_output_from_options(targetoptions):
+        if targetoptions is None:
+            return None
+        if "output" in targetoptions:
+            raise ValueError(
+                "targetoptions['output'] is not supported; use '_compile_output' instead"
+            )
+        return targetoptions.get("_compile_output", None)
+
+    def active_targetoption_updates(targetoptions):
+        updates = {
+            k: v for k, v in targetoptions.items() if k not in ("_compile_output", "abi_info")
+        }
+        if "lto" in updates and "_lto_explicit" not in updates:
+            updates["_lto_explicit"] = True
+        return updates
+
     dispatcher = pyfunc
     if not isinstance(dispatcher, MLIRDispatcher):
-        kws = targetoptions or {}
+        kws = (targetoptions or {}).copy()
+        output = compile_output_from_options(kws)
+        abi_info = kws.pop("abi_info", None)
+        kws.pop("_compile_output", None)
+        _validate_compile_output_targetoptions(kws, output)
         # Don't call verify_target_options here - jit() will do it
         dispatcher = jit(dispatcher, **kws)
-    else:
-        pyfunc = dispatcher.py_func
-        if targetoptions is not None:
-            dispatcher.targetoptions.update(targetoptions)
 
-    if sig is None:
-        sig = to_numba_type(inspect.signature(pyfunc))
+        if sig is None:
+            sig = to_numba_type(inspect.signature(pyfunc))
 
-    abi_info = targetoptions.get("abi_info", None) if targetoptions is not None else None
-    output = targetoptions.get("output", None) if targetoptions is not None else None
-    cres = dispatcher.compile(sig, abi_info=abi_info, output=output)
-    if optimized:
-        optimize(cres)
-    return CompileResult(cres)
+        return compile_dispatcher(dispatcher, sig, abi_info=abi_info, output=output)
+
+    pyfunc = dispatcher.py_func
+    output = compile_output_from_options(targetoptions)
+    if targetoptions is None:
+        if sig is None:
+            sig = to_numba_type(inspect.signature(pyfunc))
+
+        return compile_dispatcher(dispatcher, sig, output=output)
+
+    dispatcher._ensure_dispatcher_state()
+    active_updates = active_targetoption_updates(targetoptions)
+    with dispatcher._temporary_targetoptions(active_updates):
+        if sig is None:
+            sig = to_numba_type(inspect.signature(pyfunc))
+
+        abi_info = targetoptions.get("abi_info", None)
+        return compile_dispatcher(dispatcher, sig, abi_info=abi_info, output=output)
 
 
 def compile_for(func, *args):
     from numba_cuda_mlir.numba_cuda.typing.typeof import typeof
 
     sig = typing.signature(types.none, *[typeof(arg) for arg in args])
-    cres = _compile_and_optimize(func, sig, {"lto": False, "output": "ptx"})
+    cres = _compile_and_optimize(func, sig, {"lto": False})
     return cres
 
 
@@ -410,7 +445,7 @@ def compile(
         targetoptions["inline"] = "always"
     if launch_bounds is not None:
         targetoptions["launch_bounds"] = launch_bounds
-    targetoptions["output"] = output
+    targetoptions["_compile_output"] = output
 
     optimized = _compile_and_optimize(pyfunc, sig, targetoptions)
 

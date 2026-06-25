@@ -14,6 +14,8 @@ import os
 import io
 import contextlib
 
+import numpy as np
+
 
 @unittest.skipIf(not _have_nvjitlink(), "nvJitLink not installed or new enough (>12.3)")
 class TestLinker(NumbaCUDATestCase):
@@ -68,6 +70,35 @@ class TestLinker(NumbaCUDATestCase):
                     result = cuda.device_array(1)
                     kernel[1, 1](result)
                     assert result[0] == 3
+
+    def test_nvjitlink_jit_debug_cu_link_item_defaults_to_ptx(self):
+        add_source = cuda.CUSource(
+            """
+            extern "C" __device__
+            int debug_lto_add(int *out, int a)
+            {
+              *out = a + 7;
+              return 0;
+            }
+            """,
+            name="debug_lto_add.cu",
+        )
+        # declare_device defaults to the Numba device ABI: the C function writes
+        # the Python return value through the first argument and returns status.
+        debug_lto_add = cuda.declare_device("debug_lto_add", "int32(int32)", abi="numba")
+
+        @cuda.jit(link=[add_source], debug=True, opt=False)
+        def kernel(result, values):
+            i = cuda.grid(1)
+            if i < result.size:
+                result[i] = debug_lto_add(values[i])
+
+        values = np.arange(4, dtype=np.int32)
+        result = cuda.device_array_like(values)
+
+        kernel[1, 32](result, cuda.to_device(values))
+
+        np.testing.assert_array_equal(result.copy_to_host(), values + 7)
 
     @pytest.mark.numba_cuda_test_binaries("cubin")
     def test_nvjitlink_jit_with_invalid_linkable_code(self):

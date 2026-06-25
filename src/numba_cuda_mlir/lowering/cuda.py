@@ -273,7 +273,7 @@ def _ensure_cudadevrt_linked(lower: MLIRLower):
     if not lower.metadata.get("_cudadevrt_linked"):
         from numba_cuda_mlir.numba_cuda.cudadrv.libs import get_cudalib
 
-        lower.linker.add_file_guess_ext(get_cudalib("cudadevrt", static=True))
+        lower.link_external_item(get_cudalib("cudadevrt", static=True))
         lower.metadata["_cudadevrt_linked"] = True
 
 
