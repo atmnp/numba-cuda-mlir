@@ -37,9 +37,7 @@ def parse_args() -> argparse.Namespace:
 def version_from_tag(tag: str) -> str:
     match = TAG_PATTERN.match(tag)
     if not match:
-        raise ValueError(
-            f"Unsupported git tag format {tag!r}; expected vX.Y.Z."
-        )
+        raise ValueError(f"Unsupported git tag format {tag!r}; expected vX.Y.Z.")
     return match.group("version")
 
 
@@ -97,8 +95,7 @@ def main() -> int:
         errors.append(f"No wheels matching distribution {DISTRIBUTION!r} found.")
     elif len(seen_versions) > 1:
         errors.append(
-            f"Expected one release version, found multiple: "
-            + ", ".join(sorted(seen_versions))
+            f"Expected one release version, found multiple: " + ", ".join(sorted(seen_versions))
         )
 
     if errors:
