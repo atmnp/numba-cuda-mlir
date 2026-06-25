@@ -2358,8 +2358,20 @@ class _Linker:
 
         for kind, payload, name, lto in pending:
             cu = payload.data if kind == "linkable" else payload
+            if lto and self._debug:
+                raise LinkerError(
+                    "CUDA source links cannot be compiled as LTOIR with debug=True; "
+                    "use lineinfo=True for profiled LTOIR, or disable LTO."
+                )
 
-            obj, log = nvrtc.compile(cu, name, self.cc, ltoir=lto)
+            obj, log = nvrtc.compile(
+                cu,
+                name,
+                self.cc,
+                ltoir=lto,
+                lineinfo=self.lineinfo and not self._debug,
+                debug=self._debug,
+            )
 
             if not lto and config.DUMP_ASSEMBLY:
                 print(("ASSEMBLY %s" % name).center(80, "-"))

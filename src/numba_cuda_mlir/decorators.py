@@ -12,6 +12,7 @@ import inspect
 import sys
 from textwrap import dedent
 from dataclasses import dataclass
+from numba_cuda_mlir.linker import _link_item_is_cuda_source, _link_item_is_ltoir
 from numba_cuda_mlir.tools import format_arch
 
 
@@ -493,14 +494,12 @@ def _link_items_have_callbacks(link_items) -> bool:
     )
 
 
-def _link_item_is_ltoir(link_item) -> bool:
-    if isinstance(link_item, str):
-        return link_item.endswith(".ltoir")
-    return type(link_item).__name__ == "LTOIR"
-
-
 def _link_items_have_ltoir(link_items) -> bool:
     return any(_link_item_is_ltoir(link_item) for link_item in link_items)
+
+
+def _link_items_have_cuda_source(link_items) -> bool:
+    return any(_link_item_is_cuda_source(link_item) for link_item in link_items)
 
 
 def verify_target_options(kws: dict[str, Any]) -> dict[str, Any]:
@@ -562,13 +561,14 @@ def verify_target_options(kws: dict[str, Any]) -> dict[str, Any]:
     output_was_explicit = "output" in kws
     link_items = targetoptions.get("link", [])
     link_items_have_ltoir = _link_items_have_ltoir(link_items)
+    link_items_have_cuda_source = _link_items_have_cuda_source(link_items)
     if targetoptions.get("lto") is None and output_was_explicit:
         targetoptions["lto"] = targetoptions["output"] == "ltoir"
     elif targetoptions.get("lto") is None and _link_items_have_callbacks(link_items):
         targetoptions["lto"] = False
     elif (
         targetoptions.get("lto") is None
-        and link_items_have_ltoir
+        and (link_items_have_ltoir or link_items_have_cuda_source)
         and not targetoptions.get("debug")
     ):
         from numba_cuda_mlir.numba_cuda.cudadrv.driver import _have_nvjitlink

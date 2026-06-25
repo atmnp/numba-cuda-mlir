@@ -3,6 +3,8 @@
 
 import ctypes
 import os
+import re
+import warnings
 from io import StringIO
 
 from numba_cuda_mlir._mlir.passmanager import PassManager
@@ -12,7 +14,9 @@ from numba_cuda_mlir._mlir import ir
 from numba_cuda_mlir.lowering_utilities import context
 from numba_cuda_mlir.optimization import run_pre_codegen_patterns
 from numba_cuda_mlir.numba_cuda.cudadrv.nvvm import CompilationUnit
+from numba_cuda_mlir.numba_cuda.core.errors import NumbaWarning
 from numba_cuda_mlir.logging import trace
+from numba_cuda_mlir.linker import _link_item_is_cuda_source
 from numba_cuda_mlir.mlir.util import find_ops
 from numba_cuda_mlir.lowering_utilities.llvm_utils import (
     LLVM_C_LIB_PATH,
@@ -254,7 +258,201 @@ def _operation_to_text(operation, *, preserve_debug_info=False) -> str:
         return sb.getvalue()
 
 
-def _prepare_llvm_ir(module, dump=False, preserve_debug_info=False) -> bytes:
+_DEBUG_INFO_VERSION_FLAG_RE = re.compile(
+    r'^!(?P<id>\d+) = !\{[^\n]*!"Debug Info Version"[^\n]*\}\n?',
+    re.MULTILINE,
+)
+_LLVM_MODULE_FLAGS_RE = re.compile(
+    r"^!llvm\.module\.flags = !\{([^}]*)\}\n?",
+    re.MULTILINE,
+)
+_PRIVATE_DEBUG_INFO_VERSION_KEY = b"numba.cuda.mlir.debug_info_version"
+_debug_info_version_neutralization_warned = False
+
+
+def _warn_debug_info_version_flag_neutralization() -> None:
+    global _debug_info_version_neutralization_warned
+    if _debug_info_version_neutralization_warned:
+        return
+    _debug_info_version_neutralization_warned = True
+    warnings.warn(
+        "Linking CUDA source as LTOIR with lineinfo requires "
+        "neutralizing the MLIR kernel's LLVM Debug Info Version module flag. "
+        "The external CUDA source keeps its NVRTC debug metadata, but MLIR-side "
+        "lineinfo metadata may be reduced by libnvvm.",
+        category=NumbaWarning,
+    )
+
+
+def _rename_debug_info_version_module_flag_with_status(llvm_ir: bytes) -> tuple[bytes, bool]:
+    text = llvm_ir.decode("utf-8", errors="surrogateescape")
+    module_flags_match = _LLVM_MODULE_FLAGS_RE.search(text)
+    if not module_flags_match:
+        return llvm_ir, False
+
+    debug_info_version_ids = {
+        match.group("id") for match in _DEBUG_INFO_VERSION_FLAG_RE.finditer(text)
+    }
+    if not debug_info_version_ids:
+        return llvm_ir, False
+
+    module_flag_refs = {
+        operand.strip()
+        for operand in module_flags_match.group(1).split(",")
+        if operand.strip()
+    }
+    rewrite_ids = {
+        id_ for id_ in debug_info_version_ids if f"!{id_}" in module_flag_refs
+    }
+    if not rewrite_ids:
+        return llvm_ir, False
+
+    private_key = _PRIVATE_DEBUG_INFO_VERSION_KEY.decode("ascii")
+
+    def rewrite_module_flag_definition(match):
+        if match.group("id") not in rewrite_ids:
+            return match.group(0)
+        return match.group(0).replace(
+            '!"Debug Info Version"',
+            f'!"{private_key}"',
+            1,
+        )
+
+    text = _DEBUG_INFO_VERSION_FLAG_RE.sub(rewrite_module_flag_definition, text)
+    return text.encode("utf-8", errors="surrogateescape"), True
+
+
+def _rename_debug_info_version_module_flag(llvm_ir: bytes) -> bytes:
+    llvm_ir, _ = _rename_debug_info_version_module_flag_with_status(llvm_ir)
+    return llvm_ir
+
+
+def _configure_metadata_capi(capi) -> bool:
+    if getattr(capi, "_numba_cuda_mlir_metadata_configured", False):
+        return True
+
+    try:
+        capi.LLVMGetNamedMetadataNumOperands.restype = ctypes.c_uint
+        capi.LLVMGetNamedMetadataNumOperands.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        capi.LLVMGetNamedMetadataOperands.restype = None
+        capi.LLVMGetNamedMetadataOperands.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        capi.LLVMGetMDNodeNumOperands.restype = ctypes.c_uint
+        capi.LLVMGetMDNodeNumOperands.argtypes = [ctypes.c_void_p]
+        capi.LLVMGetMDNodeOperands.restype = None
+        capi.LLVMGetMDNodeOperands.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        capi.LLVMGetMDString.restype = ctypes.c_void_p
+        capi.LLVMGetMDString.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+        capi.LLVMMDStringInContext2.restype = ctypes.c_void_p
+        capi.LLVMMDStringInContext2.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        capi.LLVMReplaceMDNodeOperandWith.restype = None
+        capi.LLVMReplaceMDNodeOperandWith.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_void_p,
+        ]
+    except AttributeError:
+        return False
+
+    capi._numba_cuda_mlir_metadata_configured = True
+    return True
+
+
+def _neutralize_debug_info_version_module_flag(llvm_mod, llvm_ctx) -> tuple[bool, bool]:
+    """Rename the debug-info version module flag before LTOIR serialization.
+
+    nvJitLink can reject MLIR-generated lineinfo/debug LTOIR when it is linked
+    with NVRTC-generated LTOIR carrying an incompatible ``Debug Info Version``
+    module flag. The direct LLVM-C path does not expose a deletion API for a
+    named-metadata operand, so rename only the module-flag key and leave all
+    actual debug metadata intact. The source-link integration tests exercise
+    this with the supported toolkit's nvJitLink; the text fallback applies the
+    same key rename to the serialized IR.
+    """
+    from numba_cuda_mlir.lowering_utilities.llvm_utils import _get_capi
+
+    capi = _get_capi()
+    if not _configure_metadata_capi(capi):
+        return False, False
+
+    num_flags = capi.LLVMGetNamedMetadataNumOperands(llvm_mod, b"llvm.module.flags")
+    if num_flags == 0:
+        return True, False
+
+    flags = (ctypes.c_void_p * num_flags)()
+    capi.LLVMGetNamedMetadataOperands(llvm_mod, b"llvm.module.flags", flags)
+    replacement_key = None
+    renamed = False
+
+    for flag in flags:
+        num_ops = capi.LLVMGetMDNodeNumOperands(flag)
+        if num_ops < 3:
+            continue
+        ops = (ctypes.c_void_p * num_ops)()
+        capi.LLVMGetMDNodeOperands(flag, ops)
+
+        key_len = ctypes.c_uint()
+        key = capi.LLVMGetMDString(ops[1], ctypes.byref(key_len))
+        if not key:
+            continue
+        key_text = ctypes.string_at(key, key_len.value)
+        if key_text == b"Debug Info Version":
+            if replacement_key is None:
+                # LLVMReplaceMDNodeOperandWith takes an LLVMMetadataRef for
+                # Replacement, even though the MDNode to mutate is passed as an
+                # LLVMValueRef.
+                replacement_key = capi.LLVMMDStringInContext2(
+                    llvm_ctx,
+                    _PRIVATE_DEBUG_INFO_VERSION_KEY,
+                    len(_PRIVATE_DEBUG_INFO_VERSION_KEY),
+                )
+            # Keep the behavior/value operands intact. The real source-link
+            # path verifies nvJitLink accepts the renamed private key; changing
+            # the behavior would mutate more debug metadata than required.
+            capi.LLVMReplaceMDNodeOperandWith(flag, 1, replacement_key)
+            renamed = True
+    return True, renamed
+
+
+def _translate_gpu_module_to_libnvvm_text_ir(
+    gpu_mod,
+    ctk_major,
+    ctk_minor,
+    *,
+    dump=False,
+    preserve_debug_info=False,
+    neutralize_debug_info_version_flag=False,
+) -> bytes:
+    llvm_ir = translate_gpu_module_to_libnvvm_ir(
+        _operation_to_text(gpu_mod.operation, preserve_debug_info=preserve_debug_info),
+        ctk_major,
+        ctk_minor,
+        dump=dump,
+        emit_text_ir=preserve_debug_info or neutralize_debug_info_version_flag,
+    )
+    if neutralize_debug_info_version_flag:
+        llvm_ir, renamed = _rename_debug_info_version_module_flag_with_status(llvm_ir)
+        if renamed:
+            _warn_debug_info_version_flag_neutralization()
+    return llvm_ir
+
+
+def _prepare_llvm_ir(
+    module,
+    dump=False,
+    preserve_debug_info=False,
+    neutralize_debug_info_version_flag=False,
+) -> bytes:
     """Translate gpu.module to LLVM IR and apply libnvvm compatibility downgrades."""
     from numba_cuda_mlir._mlir.dialects import gpu
     from numba_cuda_mlir.tools import get_cuda_runtime_version
@@ -269,17 +467,38 @@ def _prepare_llvm_ir(module, dump=False, preserve_debug_info=False) -> bytes:
     ctk_major, ctk_minor = get_cuda_runtime_version()
 
     if os.name == "nt":
-        return translate_gpu_module_to_libnvvm_ir(
-            _operation_to_text(gpu_mod.operation, preserve_debug_info=preserve_debug_info),
+        # The text path rewrites serialized metadata. The direct LLVM-C path
+        # below performs the same key rename before serialization.
+        return _translate_gpu_module_to_libnvvm_text_ir(
+            gpu_mod,
             ctk_major,
             ctk_minor,
             dump=dump,
-            emit_text_ir=preserve_debug_info,
+            preserve_debug_info=preserve_debug_info,
+            neutralize_debug_info_version_flag=neutralize_debug_info_version_flag,
         )
 
     from numba_cuda_mlir._cext import downgrade_for_libnvvm
 
     llvm_mod, llvm_ctx = translate_to_llvmir(gpu_mod.operation)
+    if neutralize_debug_info_version_flag:
+        capi_available, renamed = _neutralize_debug_info_version_module_flag(
+            llvm_mod, llvm_ctx
+        )
+        if not capi_available:
+            # Some LLVM-C builds lack the metadata mutation symbols. Fall back
+            # to text translation where the problematic module flag can be
+            # renamed without mutating the LLVM module in place.
+            return _translate_gpu_module_to_libnvvm_text_ir(
+                gpu_mod,
+                ctk_major,
+                ctk_minor,
+                dump=dump,
+                preserve_debug_info=preserve_debug_info,
+                neutralize_debug_info_version_flag=True,
+            )
+        if renamed:
+            _warn_debug_info_version_flag_neutralization()
 
     if dump:
         print(f"=============== LLVM IR ===============\n\n{dump_llvmir(llvm_mod)}\n\n")
@@ -304,6 +523,25 @@ def _nvvm_options(cc: str, target_options=None, **extra) -> dict:
     if opt is False or opt == 0:
         opts["opt"] = 0
     return opts
+
+
+def _iter_external_link_items(cres, target_options):
+    yield from target_options.get("link", ()) or ()
+    yield from cres.metadata.get("external_link_items", ()) or ()
+
+
+def _needs_debug_info_version_flag_neutralization(cres, target_options, is_lto: bool) -> bool:
+    if not is_lto:
+        return False
+    if not target_options.get("lineinfo", False):
+        return False
+    # This workaround is for toolkit-controlled NVRTC compilation of CUDA
+    # source links. Prebuilt LTOIR is user-supplied, so we preserve standalone
+    # and explicit LTOIR debug metadata unless we know we are mixing in .cu.
+    return any(
+        _link_item_is_cuda_source(link_item)
+        for link_item in _iter_external_link_items(cres, target_options)
+    )
 
 
 def _compile_to_ptx(llvm_ir: bytes, cc: str, libdevice, nvvm_opts=None) -> bytes:
@@ -381,11 +619,19 @@ def _compile_ltoir_for_inspection(cres, target_options) -> bytes:
         if _needs_llvm70_path(cc):
             ltoir = _call_llvm70_capi(module, target_options, gen_lto=True)
         else:
+            neutralize_debug_info_version = (
+                _needs_debug_info_version_flag_neutralization(
+                    cres,
+                    target_options,
+                    is_lto=True,
+                )
+            )
             llvm_ir = _prepare_llvm_ir(
                 module,
                 dump=target_options.get("dump_llvmir", False),
                 preserve_debug_info=target_options.get("debug", False)
                 or target_options.get("lineinfo", False),
+                neutralize_debug_info_version_flag=neutralize_debug_info_version,
             )
             from numba_cuda_mlir.numba_cuda.cudadrv.nvvm import LibDevice
 
@@ -632,11 +878,19 @@ def optimize(cres):
         if use_llvm70:
             llvm_ir = None
         else:
+            neutralize_debug_info_version = (
+                _needs_debug_info_version_flag_neutralization(
+                    cres,
+                    target_options,
+                    is_lto,
+                )
+            )
             llvm_ir = _prepare_llvm_ir(
                 module,
                 dump=target_options.get("dump_llvmir", False),
                 preserve_debug_info=target_options.get("debug", False)
                 or target_options.get("lineinfo", False),
+                neutralize_debug_info_version_flag=neutralize_debug_info_version,
             )
 
         linker = cres.metadata["linker"].recreate_with_lto()

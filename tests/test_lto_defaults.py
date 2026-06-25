@@ -2,13 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for MLIR JIT LTO option defaults."""
 
+import ctypes
 import types
 
 import pytest
 
-from numba_cuda_mlir import cuda
+from numba_cuda_mlir import cuda, mlir_optimization
 from numba_cuda_mlir.caching import _targetoptions_cache_key
+from numba_cuda_mlir.linker import _link_item_is_cuda_source, _link_item_is_ltoir
 from numba_cuda_mlir.mlir_lowering import MLIRLower
+from numba_cuda_mlir.numba_cuda.core.errors import NumbaWarning
 
 
 def _kernel():
@@ -19,6 +22,314 @@ def _set_nvjitlink_available(monkeypatch, available):
     from numba_cuda_mlir.numba_cuda.cudadrv import driver
 
     monkeypatch.setattr(driver, "_have_nvjitlink", lambda: available)
+
+
+def test_link_item_helpers_accept_linkable_kind_attributes():
+    cu_item = types.SimpleNamespace(kind="cu")
+    ltoir_item = types.SimpleNamespace(kind="ltoir")
+    ptx_item = types.SimpleNamespace(kind="ptx")
+
+    assert _link_item_is_cuda_source(cu_item)
+    assert not _link_item_is_ltoir(cu_item)
+    assert _link_item_is_ltoir(ltoir_item)
+    assert not _link_item_is_cuda_source(ltoir_item)
+    assert not _link_item_is_cuda_source(ptx_item)
+    assert not _link_item_is_ltoir(ptx_item)
+
+
+def test_ltoir_debug_info_version_module_flag_is_renamed():
+    llvm_ir = b"""
+!llvm.module.flags = !{!2, !3}
+!2 = !{i32 2, !"Debug Info Version", i32 3}
+!3 = !{i32 1, !"wchar_size", i32 4}
+"""
+
+    rewritten = mlir_optimization._rename_debug_info_version_module_flag(llvm_ir)
+
+    assert b"Debug Info Version" not in rewritten
+    assert mlir_optimization._PRIVATE_DEBUG_INFO_VERSION_KEY in rewritten
+    assert b"!llvm.module.flags = !{!2, !3}" in rewritten
+    assert b"wchar_size" in rewritten
+
+
+def test_ltoir_debug_info_version_module_flag_rename_preserves_unrewritable_ir():
+    llvm_ir = b"""
+!2 = !{i32 2, !"Debug Info Version", i32 3}
+!3 = !{i32 1, !"wchar_size", i32 4}
+"""
+
+    assert mlir_optimization._rename_debug_info_version_module_flag(llvm_ir) == llvm_ir
+
+
+def test_ltoir_debug_info_version_module_flag_neutralize_reports_missing_capi(
+    monkeypatch,
+):
+    from numba_cuda_mlir.lowering_utilities import llvm_utils
+
+    class MissingMetadataCAPI:
+        pass
+
+    monkeypatch.setattr(llvm_utils, "_get_capi", lambda: MissingMetadataCAPI())
+
+    assert mlir_optimization._neutralize_debug_info_version_module_flag(100, 200) == (
+        False,
+        False,
+    )
+
+
+def test_ltoir_debug_info_version_module_flag_is_neutralized_with_metadata_operand(
+    monkeypatch,
+):
+    from numba_cuda_mlir.lowering_utilities import llvm_utils
+
+    class FakeMetadataCAPI:
+        _numba_cuda_mlir_metadata_configured = True
+        module = 100
+        context = 200
+        flag = 300
+        behavior = 400
+        key_value = 500
+        version = 600
+        replacement_metadata = 700
+
+        def __init__(self):
+            self.key_text = b"Debug Info Version"
+            self.key_buffer = ctypes.create_string_buffer(self.key_text)
+            self.created_key = None
+            self.replacements = []
+
+        def LLVMGetNamedMetadataNumOperands(self, module, name):
+            assert module == self.module
+            assert name == b"llvm.module.flags"
+            return 1
+
+        def LLVMGetNamedMetadataOperands(self, module, name, flags):
+            assert module == self.module
+            assert name == b"llvm.module.flags"
+            flags[0] = self.flag
+
+        def LLVMGetMDNodeNumOperands(self, flag):
+            assert flag == self.flag
+            return 3
+
+        def LLVMGetMDNodeOperands(self, flag, operands):
+            assert flag == self.flag
+            operands[0] = self.behavior
+            operands[1] = self.key_value
+            operands[2] = self.version
+
+        def LLVMGetMDString(self, operand, length):
+            assert operand == self.key_value
+            length._obj.value = len(self.key_text)
+            return ctypes.addressof(self.key_buffer)
+
+        def LLVMMDStringInContext2(self, context, key, length):
+            assert context == self.context
+            self.created_key = ctypes.string_at(key, length)
+            return self.replacement_metadata
+
+        def LLVMReplaceMDNodeOperandWith(self, flag, index, replacement):
+            self.replacements.append((flag, index, replacement))
+
+    fake_capi = FakeMetadataCAPI()
+    monkeypatch.setattr(llvm_utils, "_get_capi", lambda: fake_capi)
+
+    assert mlir_optimization._neutralize_debug_info_version_module_flag(
+        fake_capi.module,
+        fake_capi.context,
+    ) == (True, True)
+
+    assert fake_capi.created_key == mlir_optimization._PRIVATE_DEBUG_INFO_VERSION_KEY
+    assert fake_capi.replacements == [(fake_capi.flag, 1, fake_capi.replacement_metadata)]
+
+
+def test_prepare_llvm_ir_uses_text_fallback_when_metadata_capi_is_missing(monkeypatch):
+    from numba_cuda_mlir import tools
+    from numba_cuda_mlir._mlir.dialects import gpu
+
+    class FakeOperation:
+        def __init__(self):
+            self.attributes = {}
+
+        def print(self, *args, **kwargs):
+            kwargs["file"].write("fake gpu module")
+
+    class FakeGPUModuleOp:
+        def __init__(self):
+            self.operation = FakeOperation()
+
+    fake_gpu_mod = FakeGPUModuleOp()
+    module = types.SimpleNamespace(body=[fake_gpu_mod])
+    text_calls = []
+
+    monkeypatch.setattr(gpu, "GPUModuleOp", FakeGPUModuleOp)
+    monkeypatch.setattr(
+        mlir_optimization,
+        "ir",
+        types.SimpleNamespace(
+            StringAttr=types.SimpleNamespace(get=lambda value: f"attr:{value}")
+        ),
+    )
+    monkeypatch.setattr(tools, "get_cuda_runtime_version", lambda: (12, 9))
+    monkeypatch.setattr(
+        mlir_optimization,
+        "translate_to_llvmir",
+        lambda operation: ("llvm_mod", "llvm_ctx"),
+    )
+    monkeypatch.setattr(
+        mlir_optimization,
+        "_neutralize_debug_info_version_module_flag",
+        lambda llvm_mod, llvm_ctx: (False, False),
+    )
+
+    def fake_text_path(
+        gpu_mod,
+        ctk_major,
+        ctk_minor,
+        *,
+        dump=False,
+        preserve_debug_info=False,
+        neutralize_debug_info_version_flag=False,
+    ):
+        text_calls.append(
+            (
+                gpu_mod,
+                ctk_major,
+                ctk_minor,
+                dump,
+                preserve_debug_info,
+                neutralize_debug_info_version_flag,
+            )
+        )
+        return b"text-ir"
+
+    monkeypatch.setattr(
+        mlir_optimization,
+        "_translate_gpu_module_to_libnvvm_text_ir",
+        fake_text_path,
+    )
+
+    result = mlir_optimization._prepare_llvm_ir(
+        module,
+        dump=True,
+        preserve_debug_info=True,
+        neutralize_debug_info_version_flag=True,
+    )
+
+    assert result == b"text-ir"
+    assert text_calls == [(fake_gpu_mod, 12, 9, True, True, True)]
+
+
+def test_prepare_llvm_ir_neutralizes_debug_info_version_on_text_path(
+    monkeypatch,
+):
+    from numba_cuda_mlir import tools
+    from numba_cuda_mlir._mlir.dialects import gpu
+
+    class FakeOperation:
+        def __init__(self):
+            self.attributes = {}
+
+        def print(self, *args, **kwargs):
+            kwargs["file"].write("fake gpu module")
+
+    class FakeGPUModuleOp:
+        def __init__(self):
+            self.operation = FakeOperation()
+
+    fake_gpu_mod = FakeGPUModuleOp()
+    module = types.SimpleNamespace(body=[fake_gpu_mod])
+    llvm_ir = b"""
+!llvm.module.flags = !{!2, !3}
+!2 = !{i32 2, !"Debug Info Version", i32 3}
+!3 = !{i32 1, !"wchar_size", i32 4}
+"""
+
+    monkeypatch.setattr(gpu, "GPUModuleOp", FakeGPUModuleOp)
+    monkeypatch.setattr(
+        mlir_optimization,
+        "ir",
+        types.SimpleNamespace(
+            StringAttr=types.SimpleNamespace(get=lambda value: f"attr:{value}")
+        ),
+    )
+    monkeypatch.setattr(tools, "get_cuda_runtime_version", lambda: (12, 9))
+    monkeypatch.setattr(mlir_optimization.os, "name", "nt")
+    monkeypatch.setattr(
+        mlir_optimization,
+        "translate_gpu_module_to_libnvvm_ir",
+        lambda *args, **kwargs: llvm_ir,
+    )
+    monkeypatch.setattr(
+        mlir_optimization,
+        "_debug_info_version_neutralization_warned",
+        False,
+    )
+
+    with pytest.warns(NumbaWarning, match="Debug Info Version"):
+        result = mlir_optimization._prepare_llvm_ir(
+            module,
+            preserve_debug_info=True,
+            neutralize_debug_info_version_flag=True,
+        )
+
+    assert b"Debug Info Version" not in result
+    assert mlir_optimization._PRIVATE_DEBUG_INFO_VERSION_KEY in result
+
+
+def test_debug_info_version_neutralization_requires_cuda_source_lto_link():
+    cres = types.SimpleNamespace(metadata={})
+
+    assert mlir_optimization._needs_debug_info_version_flag_neutralization(
+        cres,
+        {"lto": True, "lineinfo": True, "link": ["external.cu"]},
+        is_lto=True,
+    )
+    assert not mlir_optimization._needs_debug_info_version_flag_neutralization(
+        cres,
+        {"output": "ltoir", "lineinfo": True, "link": []},
+        is_lto=True,
+    )
+    assert not mlir_optimization._needs_debug_info_version_flag_neutralization(
+        cres,
+        {"lto": True, "lineinfo": True, "link": ["external.ltoir"]},
+        is_lto=True,
+    )
+    assert not mlir_optimization._needs_debug_info_version_flag_neutralization(
+        cres,
+        {"lto": True, "lineinfo": False, "link": ["external.cu"]},
+        is_lto=True,
+    )
+    assert not mlir_optimization._needs_debug_info_version_flag_neutralization(
+        cres,
+        {"lto": True, "debug": True, "lineinfo": False, "link": ["external.cu"]},
+        is_lto=True,
+    )
+
+
+def test_debug_info_version_neutralization_includes_discovered_cuda_source_links():
+    cres = types.SimpleNamespace(metadata={"external_link_items": ["hidden.cu"]})
+
+    assert mlir_optimization._needs_debug_info_version_flag_neutralization(
+        cres,
+        {"lto": True, "lineinfo": True, "link": []},
+        is_lto=True,
+    )
+
+
+def test_debug_info_version_neutralization_warning_is_once(monkeypatch, recwarn):
+    monkeypatch.setattr(
+        mlir_optimization,
+        "_debug_info_version_neutralization_warned",
+        False,
+    )
+
+    mlir_optimization._warn_debug_info_version_flag_neutralization()
+    mlir_optimization._warn_debug_info_version_flag_neutralization()
+
+    warnings = [warning for warning in recwarn if warning.category is NumbaWarning]
+    assert len(warnings) == 1
+    assert "Debug Info Version" in str(warnings[0].message)
 
 
 def test_mlir_jit_defaults_to_ptx_linking():
@@ -38,12 +349,12 @@ def test_mlir_jit_enables_implicit_lto_for_ltoir_link_items(monkeypatch):
     assert dispatcher.targetoptions["_lto_explicit"] is False
 
 
-def test_mlir_jit_keeps_cu_link_items_on_ptx_by_default(monkeypatch):
+def test_mlir_jit_enables_implicit_lto_for_cu_link_items(monkeypatch):
     _set_nvjitlink_available(monkeypatch, True)
 
     dispatcher = cuda.jit(link=["external.cu"])(_kernel)
 
-    assert dispatcher.targetoptions["lto"] is False
+    assert dispatcher.targetoptions["lto"] is True
     assert dispatcher.targetoptions["_lto_explicit"] is False
 
 
@@ -108,6 +419,15 @@ def test_mlir_jit_enables_implicit_lto_for_lineinfo_external_link_items(monkeypa
     _set_nvjitlink_available(monkeypatch, True)
 
     dispatcher = cuda.jit(link=["external.ltoir"], lineinfo=True)(_kernel)
+
+    assert dispatcher.targetoptions["lto"] is True
+    assert dispatcher.targetoptions["_lto_explicit"] is False
+
+
+def test_mlir_jit_enables_implicit_lto_for_lineinfo_cu_link_items(monkeypatch):
+    _set_nvjitlink_available(monkeypatch, True)
+
+    dispatcher = cuda.jit(link=["external.cu"], lineinfo=True)(_kernel)
 
     assert dispatcher.targetoptions["lto"] is True
     assert dispatcher.targetoptions["_lto_explicit"] is False
@@ -197,12 +517,31 @@ def _fake_lower_for_linking(targetoptions):
     return lower, linkers
 
 
-def test_lowering_keeps_discovered_cu_link_item_on_ptx_by_default(monkeypatch):
+def test_lowering_enables_implicit_lto_for_discovered_cu_link_item(monkeypatch):
     _set_nvjitlink_available(monkeypatch, True)
     lower, linkers = _fake_lower_for_linking(
         {
             "lto": False,
             "debug": False,
+            "lineinfo": False,
+            "_lto_explicit": False,
+            "_output_explicit": False,
+        }
+    )
+
+    lower.link_external_item("external.cu")
+
+    assert lower.targetoptions["lto"] is True
+    assert lower._linker_config["lto"] is True
+    assert linkers[-1].link_items == ["external.cu"]
+
+
+def test_lowering_keeps_discovered_cu_link_item_on_ptx_for_debug(monkeypatch):
+    _set_nvjitlink_available(monkeypatch, True)
+    lower, linkers = _fake_lower_for_linking(
+        {
+            "lto": False,
+            "debug": True,
             "lineinfo": False,
             "_lto_explicit": False,
             "_output_explicit": False,
@@ -350,7 +689,7 @@ def test_lowering_preserves_explicit_output_ptx_for_discovered_external_link_ite
     assert linkers[-1].link_items == ["external.cu"]
 
 
-def test_lowering_enables_implicit_lto_for_lineinfo_discovered_external_link_item(
+def test_lowering_enables_implicit_lto_for_lineinfo_discovered_cu_link_item(
     monkeypatch,
 ):
     _set_nvjitlink_available(monkeypatch, True)
@@ -364,11 +703,11 @@ def test_lowering_enables_implicit_lto_for_lineinfo_discovered_external_link_ite
         }
     )
 
-    lower.link_external_item("external.ltoir")
+    lower.link_external_item("external.cu")
 
     assert lower.targetoptions["lto"] is True
     assert lower._linker_config["lto"] is True
-    assert linkers[-1].link_items == ["external.ltoir"]
+    assert linkers[-1].link_items == ["external.cu"]
 
 
 def test_lowering_preserves_explicit_output_ltoir_for_callback_link_item(monkeypatch):

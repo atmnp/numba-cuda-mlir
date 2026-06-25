@@ -4,6 +4,7 @@
 import numpy as np
 import pytest
 import io
+import inspect
 import pathlib
 import unittest
 import unittest.mock
@@ -621,6 +622,47 @@ __device__ int foo(int x) {
             linker._materialize_pending_cu()
 
         self.assertFalse(compile.call_args.kwargs["ltoir"])
+
+    def test_nvrtc_compile_accepts_deferred_cu_debug_options(self):
+        signature = inspect.signature(cuda_driver.nvrtc.compile)
+
+        self.assertIn("lineinfo", signature.parameters)
+        self.assertIn("debug", signature.parameters)
+
+    def test_deferred_cu_forwards_lineinfo_to_nvrtc(self):
+        fake_obj = unittest.mock.Mock()
+        linker = _Linker(max_registers=0, cc=(7, 5), lto=True, lineinfo=True)
+        linker.add_cu("__device__ int foo() { return 1; }", "foo.cu")
+
+        with unittest.mock.patch.object(
+            cuda_driver.nvrtc, "compile", return_value=(fake_obj, "")
+        ) as compile:
+            linker._materialize_pending_cu()
+
+        self.assertTrue(compile.call_args.kwargs["ltoir"])
+        self.assertTrue(compile.call_args.kwargs["lineinfo"])
+        self.assertFalse(compile.call_args.kwargs["debug"])
+
+    def test_deferred_cu_forwards_debug_and_suppresses_lineinfo_to_nvrtc(self):
+        fake_obj = unittest.mock.Mock()
+        linker = _Linker(max_registers=0, cc=(7, 5), lto=False, lineinfo=True, debug=True)
+        linker.add_cu("__device__ int foo() { return 1; }", "foo.cu")
+
+        with unittest.mock.patch.object(
+            cuda_driver.nvrtc, "compile", return_value=(fake_obj, "")
+        ) as compile:
+            linker._materialize_pending_cu()
+
+        self.assertFalse(compile.call_args.kwargs["ltoir"])
+        self.assertFalse(compile.call_args.kwargs["lineinfo"])
+        self.assertTrue(compile.call_args.kwargs["debug"])
+
+    def test_deferred_cu_rejects_debug_ltoir_nvrtc_compile(self):
+        linker = _Linker(max_registers=0, cc=(7, 5), lto=True, debug=True)
+        linker.add_cu("__device__ int foo() { return 1; }", "foo.cu")
+
+        with self.assertRaisesRegex(LinkerError, "debug=True"):
+            linker._materialize_pending_cu()
 
     def test_recreate_with_lto_materializes_pending_cu(self):
         fake_obj = unittest.mock.Mock()
