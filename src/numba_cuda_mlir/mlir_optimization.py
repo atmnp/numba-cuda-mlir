@@ -533,7 +533,9 @@ def get_lto_ptx(cres, linker=None, target_options=None) -> str:
     diag_linker = linker.recreate_with_lto(lto=True, ltoir_only=True)
     diag_linker.additional_flags = ["-ptx"]
     diag_linker.add_ltoir(_get_ltoir(cres, target_options))
-    for link_file in cres.metadata.get("linked_external_link_items", target_options.get("link", [])):
+    for link_file in cres.metadata.get(
+        "linked_external_link_items", target_options.get("link", [])
+    ):
         diag_linker.add_file_guess_ext(link_file, ignore_nonlto=True)
     if cres.metadata.get("needs_nrt") and not cres.metadata.get("nrt_inline"):
         _maybe_link_nrt(diag_linker)

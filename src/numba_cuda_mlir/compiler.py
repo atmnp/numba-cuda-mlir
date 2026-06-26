@@ -317,11 +317,7 @@ def _compile(pyfunc, sig=None, targetoptions=None, optimized=True):
         )
         if targetoptions is not None:
             dispatcher.targetoptions.update(
-                {
-                    k: v
-                    for k, v in targetoptions.items()
-                    if k not in ("output", "_compile_output")
-                }
+                {k: v for k, v in targetoptions.items() if k not in ("output", "_compile_output")}
             )
 
     if sig is None:

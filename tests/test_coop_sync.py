@@ -93,7 +93,9 @@ def test_dynamic_shared_memory_gep_has_no_no_wrap_flags(monkeypatch):
     )
 
     shared_geps = [
-        line for line in mlir.splitlines() if "llvm.getelementptr" in line and "!llvm.ptr<3>" in line
+        line
+        for line in mlir.splitlines()
+        if "llvm.getelementptr" in line and "!llvm.ptr<3>" in line
     ]
     assert shared_geps
     assert all("inbounds" not in line and "nuw" not in line for line in shared_geps)
