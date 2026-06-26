@@ -45,6 +45,7 @@ llvm::Error LibNVVMCompiler::resolveSymbols() {
   RESOLVE(fnGetCompiledResult, "nvvmGetCompiledResult");
   RESOLVE(fnGetProgramLogSize, "nvvmGetProgramLogSize");
   RESOLVE(fnGetProgramLog, "nvvmGetProgramLog");
+  RESOLVE(fnIRVersion, "nvvmIRVersion");
   return llvm::Error::success();
 }
 
@@ -123,4 +124,23 @@ std::string LibNVVMCompiler::getLog(nvvmProgram prog) {
     fnGetProgramLog(prog, log.data());
   }
   return log;
+}
+
+llvm::Expected<NVVMIRVersion> LibNVVMCompiler::getIRVersion() const {
+  int irMajor = 0;
+  int irMinor = 0;
+  int debugMajor = 0;
+  int debugMinor = 0;
+  nvvmResult rc = fnIRVersion(&irMajor, &irMinor, &debugMajor, &debugMinor);
+  if (rc != NVVM_SUCCESS)
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "nvvmIRVersion failed (%d)", (int)rc);
+
+  NVVMIRVersion version;
+  version.irMajor = irMajor;
+  version.irMinor = irMinor;
+  version.debugMajor = debugMajor;
+  version.debugMinor = debugMinor;
+  version.hasDebugVersion = true;
+  return version;
 }

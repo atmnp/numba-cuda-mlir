@@ -20,6 +20,14 @@
 
 namespace llvm70 {
 
+struct NVVMIRVersion {
+  unsigned irMajor = 2;
+  unsigned irMinor = 0;
+  unsigned debugMajor = 0;
+  unsigned debugMinor = 0;
+  bool hasDebugVersion = false;
+};
+
 // Opaque handle matching nvvm.h
 using nvvmProgram = struct _nvvmProgram *;
 
@@ -56,6 +64,9 @@ public:
   /// Get the program log (warnings, errors) from libnvvm.
   std::string getLog(nvvmProgram prog);
 
+  /// Query the NVVM IR and debug metadata version expected by libnvvm.
+  llvm::Expected<NVVMIRVersion> getIRVersion() const;
+
 private:
   LibNVVMCompiler() = default;
   llvm::Error resolveSymbols();
@@ -74,6 +85,7 @@ private:
   nvvmResult (*fnGetCompiledResult)(nvvmProgram, char *) = nullptr;
   nvvmResult (*fnGetProgramLogSize)(nvvmProgram, size_t *) = nullptr;
   nvvmResult (*fnGetProgramLog)(nvvmProgram, char *) = nullptr;
+  nvvmResult (*fnIRVersion)(int *, int *, int *, int *) = nullptr;
 };
 
 } // namespace llvm70

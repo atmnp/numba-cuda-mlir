@@ -37,8 +37,19 @@ llvm::Expected<std::string> llvm70::translateToNVVMIR(gpu::GPUModuleOp gpuMod,
   if (!opts.dataLayout.empty())
     builder->setDataLayout(opts.dataLayout.c_str());
 
+  NVVMIRVersion nvvmIRVersion;
+  if (!opts.libnvvmPath.empty()) {
+    auto compilerOrErr = LibNVVMCompiler::create(opts.libnvvmPath);
+    if (!compilerOrErr)
+      return compilerOrErr.takeError();
+    auto versionOrErr = (*compilerOrErr)->getIRVersion();
+    if (!versionOrErr)
+      return versionOrErr.takeError();
+    nvvmIRVersion = *versionOrErr;
+  }
+
   MLIRToLLVM70 translator(*builder);
-  if (auto err = translator.translate(gpuMod, opts.debugLevel))
+  if (auto err = translator.translate(gpuMod, opts.debugLevel, nvvmIRVersion))
     return std::move(err);
 
   return builder->printModuleToString();
@@ -55,8 +66,16 @@ llvm::Expected<std::string> llvm70::translateToPTX(gpu::GPUModuleOp gpuMod,
   if (!opts.dataLayout.empty())
     builder->setDataLayout(opts.dataLayout.c_str());
 
+  auto compilerOrErr = LibNVVMCompiler::create(opts.libnvvmPath);
+  if (!compilerOrErr) {
+    return compilerOrErr.takeError();
+  }
+  auto versionOrErr = (*compilerOrErr)->getIRVersion();
+  if (!versionOrErr)
+    return versionOrErr.takeError();
+
   MLIRToLLVM70 translator(*builder);
-  if (auto err = translator.translate(gpuMod, opts.debugLevel))
+  if (auto err = translator.translate(gpuMod, opts.debugLevel, *versionOrErr))
     return std::move(err);
 
   LLVM_DEBUG({
@@ -88,13 +107,6 @@ llvm::Expected<std::string> llvm70::translateToPTX(gpu::GPUModuleOp gpuMod,
     libBuffers.emplace_back(sz, '\0');
     file.read(libBuffers.back().data(), sz);
     modules.push_back({libBuffers.back().data(), sz});
-  }
-
-  // Compile via libnvvm
-  auto compilerOrErr = LibNVVMCompiler::create(opts.libnvvmPath);
-  if (!compilerOrErr) {
-    builder->disposeMemoryBuffer(buf);
-    return compilerOrErr.takeError();
   }
 
   std::string computeArch =
@@ -269,7 +281,8 @@ void MLIRToLLVM70::setDebugLocFromOp(Operation *op) {
 // Top-level translation
 //===----------------------------------------------------------------------===//
 
-llvm::Error MLIRToLLVM70::translate(gpu::GPUModuleOp gpuMod, int debugLevel) {
+llvm::Error MLIRToLLVM70::translate(gpu::GPUModuleOp gpuMod, int debugLevel,
+                                    NVVMIRVersion nvvmIRVersion) {
   bool needFullDebug = (debugLevel >= 2);
   if (debugLevel > 0) {
     // Upgrade to FullDebug when the IR contains debug variable intrinsics
@@ -353,10 +366,17 @@ llvm::Error MLIRToLLVM70::translate(gpu::GPUModuleOp gpuMod, int debugLevel) {
     b.addNamedMetadataOperand("llvm.module.flags", b.mdNode(flagVals, 3));
   }
 
-  // Emit !nvvmir.version = !{!{i32 2, i32 0}} so libnvvm accepts the bitcode.
-  LLVMValueRef verVals[2] = {b.constInt(b.i32Ty(), 2, false),
-                             b.constInt(b.i32Ty(), 0, false)};
-  LLVMValueRef verNode = b.mdNode(verVals, 2);
+  // Emit the NVVM IR version expected by the active libnvvm. When debug
+  // metadata is present, libnvvm requires the debug metadata version operands.
+  llvm::SmallVector<LLVMValueRef, 4> verVals = {
+      b.constInt(b.i32Ty(), nvvmIRVersion.irMajor, false),
+      b.constInt(b.i32Ty(), nvvmIRVersion.irMinor, false),
+  };
+  if (diCompileUnit && nvvmIRVersion.hasDebugVersion) {
+    verVals.push_back(b.constInt(b.i32Ty(), nvvmIRVersion.debugMajor, false));
+    verVals.push_back(b.constInt(b.i32Ty(), nvvmIRVersion.debugMinor, false));
+  }
+  LLVMValueRef verNode = b.mdNode(verVals.data(), verVals.size());
   b.addNamedMetadataOperand("nvvmir.version", verNode);
 
   return llvm::Error::success();

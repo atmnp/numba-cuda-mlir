@@ -65,7 +65,8 @@ public:
 
   /// Translate all ops in the given gpu.module.
   /// debugLevel: 0=none, 1=lineinfo, 2=full debug
-  llvm::Error translate(mlir::gpu::GPUModuleOp gpuMod, int debugLevel = 1);
+  llvm::Error translate(mlir::gpu::GPUModuleOp gpuMod, int debugLevel = 1,
+                        NVVMIRVersion nvvmIRVersion = {});
 
 private:
   LLVM70IRBuilder &b;

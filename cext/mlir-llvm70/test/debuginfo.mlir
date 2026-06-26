@@ -33,6 +33,8 @@ module {
 // NVRTC-generated CUDA-source LTOIR.
 // CHECK-IR-DAG: !llvm.module.flags = !{![[DBG_VERSION:[0-9]+]]}
 // CHECK-IR-DAG: ![[DBG_VERSION]] = !{i32 1, !"Debug Info Version", i32 3}
+// CHECK-IR-DAG: !nvvmir.version = !{![[NVVMIR_VERSION:[0-9]+]]}
+// CHECK-IR-DAG: ![[NVVMIR_VERSION]] = !{i32 {{[0-9]+}}, i32 {{[0-9]+}}, i32 {{[0-9]+}}, i32 {{[0-9]+}}}
 
 // Metadata comes after functions — verify compile unit, subprograms, and file.
 // CHECK-IR-DAG: !DICompileUnit(language: DW_LANG_C,{{.*}}producer: "llvm7"{{.*}}isOptimized: false
