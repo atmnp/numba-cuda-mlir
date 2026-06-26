@@ -1,10 +1,30 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+import importlib
+import sys
+
 from numba_cuda_mlir import cuda
 import pytest
 import numpy as np
 
 DeviceNDArray = cuda.DeviceNDArray
+
+
+def test_numpy_2_import_without_row_stack(monkeypatch):
+    numpy_support = importlib.import_module("numba_cuda_mlir.numba_cuda.np.numpy_support")
+    module_name = "numba_cuda_mlir.numba_cuda.np.arrayobj"
+    old_module = sys.modules.get(module_name)
+
+    monkeypatch.setattr(numpy_support, "numpy_version", (2, 4))
+    monkeypatch.delattr(np, "row_stack", raising=False)
+    sys.modules.pop(module_name, None)
+
+    try:
+        importlib.import_module(module_name)
+    finally:
+        sys.modules.pop(module_name, None)
+        if old_module is not None:
+            sys.modules[module_name] = old_module
 
 
 @pytest.mark.parametrize("op", [np.sum, np.mean])
