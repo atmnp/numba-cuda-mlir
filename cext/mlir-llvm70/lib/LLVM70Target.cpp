@@ -345,7 +345,9 @@ llvm::Error MLIRToLLVM70::translate(gpu::GPUModuleOp gpuMod, int debugLevel) {
 
   if (diCompileUnit) {
     b.finalizeDebugInfo();
-    LLVMValueRef flagVals[3] = {b.constInt(b.i32Ty(), 2, false),
+    // Match NVRTC's Error behavior so nvJitLink can merge this module flag
+    // when LLVM70-generated LTOIR is linked with CUDA-source LTOIR.
+    LLVMValueRef flagVals[3] = {b.constInt(b.i32Ty(), 1, false),
                                 b.mdString("Debug Info Version", 18),
                                 b.constInt(b.i32Ty(), 3, false)};
     b.addNamedMetadataOperand("llvm.module.flags", b.mdNode(flagVals, 3));

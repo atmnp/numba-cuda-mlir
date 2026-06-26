@@ -29,17 +29,20 @@ module {
 // CHECK-IR: define ptx_kernel void @debug_kernel2(
 // CHECK-IR: store i32 42{{.*}}!dbg
 
-// Metadata comes after functions — verify compile unit, subprograms, and file.
-// CHECK-IR: !DICompileUnit(language: DW_LANG_C,
-// CHECK-IR-SAME: producer: "llvm70"
-// CHECK-IR-SAME: emissionKind: DebugDirectviesOnly
+// Verify Debug Info Version uses Error behavior so nvJitLink can merge it with
+// NVRTC-generated CUDA-source LTOIR.
+// CHECK-IR-DAG: !llvm.module.flags = !{![[DBG_VERSION:[0-9]+]]}
+// CHECK-IR-DAG: ![[DBG_VERSION]] = !{i32 1, !"Debug Info Version", i32 3}
 
-// CHECK-IR: !DISubprogram(name: "debug_kernel",
+// Metadata comes after functions — verify compile unit, subprograms, and file.
+// CHECK-IR-DAG: !DICompileUnit(language: DW_LANG_C,{{.*}}producer: "llvm7"{{.*}}isOptimized: false
+
+// CHECK-IR-DAG: !DISubprogram(name: "debug_kernel",
 // CHECK-IR-SAME: file: ![[FILE:[0-9]+]]
 // CHECK-IR-SAME: isDefinition: true
-// CHECK-IR: ![[FILE]] = !DIFile(filename: "debuginfo.mlir"
+// CHECK-IR-DAG: ![[FILE]] = !DIFile(filename: "debuginfo.mlir"
 
-// CHECK-IR: !DISubprogram(name: "debug_kernel2",
+// CHECK-IR-DAG: !DISubprogram(name: "debug_kernel2",
 
 // Verify PTX compiles successfully with debug info present in the IR.
 // CHECK-PTX: .visible .entry debug_kernel
