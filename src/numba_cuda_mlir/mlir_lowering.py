@@ -1303,10 +1303,7 @@ extern "C" __global__ void
             case "static_getitem":
                 value_type = self.get_numba_type(expr.value.name)
                 index = expr.index
-                if (
-                    not isinstance(value_type, types.BaseTuple)
-                    and expr.index_var is not None
-                ):
+                if not isinstance(value_type, types.BaseTuple) and expr.index_var is not None:
                     index = expr.index_var
                 self.lower_getitem_expr_assign(target, expr.value, index)
             case "call":
