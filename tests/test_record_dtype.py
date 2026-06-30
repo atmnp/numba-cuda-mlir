@@ -26,6 +26,10 @@ recordwith2darray = np.dtype([("i", np.int32), ("j", np.float32, (3, 2))])
 
 recordwithvaluestorage = np.dtype([("h", np.float16), ("flag", np.bool_)], align=True)
 
+nestedrecordwitharray = np.dtype([("inner", [("a", np.float64), ("b", np.float64)], (1,))])
+
+nestedrecord = np.dtype([("inner", [("a", np.float64), ("b", np.float64)])])
+
 
 class TestRecordTypeModel:
     """Test that Record types can be converted to MLIR types."""
@@ -252,6 +256,25 @@ class TestRecordFieldAccess:
         result = arr.copy_to_host()
         np.testing.assert_allclose(result["h"], np.array([1.5, 2.5], dtype=np.float16))
         np.testing.assert_array_equal(result["flag"], np.array([True, False]))
+
+    @pytest.mark.skipif(not cuda.is_available(), reason="CUDA not available")
+    def test_set_nested_record_fields(self):
+        @cuda.jit
+        def set_fields(ary, scalar_ary):
+            ary[0]["inner"][0]["a"] = 11.0
+            ary[0]["inner"][0]["b"] = 22.0
+            scalar_ary[0]["inner"]["a"] = 33.0
+            scalar_ary[0]["inner"]["b"] = 44.0
+
+        arr = cuda.to_device(np.zeros(2, dtype=nestedrecordwitharray))
+        scalar_arr = cuda.to_device(np.zeros(2, dtype=nestedrecord))
+        set_fields[1, 1](arr, scalar_arr)
+        result = arr.copy_to_host()
+        scalar_result = scalar_arr.copy_to_host()
+        np.testing.assert_equal(result[0]["inner"][0]["a"], 11.0)
+        np.testing.assert_equal(result[0]["inner"][0]["b"], 22.0)
+        np.testing.assert_equal(scalar_result[0]["inner"]["a"], 33.0)
+        np.testing.assert_equal(scalar_result[0]["inner"]["b"], 44.0)
 
 
 @pytest.mark.skip(reason="Causes memory errors")
