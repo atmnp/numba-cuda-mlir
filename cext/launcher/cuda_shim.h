@@ -51,6 +51,7 @@ typedef enum {
     CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_BLOCK      = 12,
     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR     = 75,
     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR     = 76,
+    CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN = 97,
 } CUdevice_attribute;
 
 /* ---- pointer / function attributes ------------------------------------- */
@@ -60,6 +61,7 @@ typedef enum {
 } CUpointer_attribute;
 
 typedef enum {
+    CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES             = 1,
     CU_FUNC_ATTRIBUTE_NUM_REGS                      = 4,
     CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8,
 } CUfunction_attribute;
