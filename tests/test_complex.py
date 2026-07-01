@@ -10,6 +10,29 @@ from numba_cuda_mlir.numba_cuda import types
 from numba_cuda_mlir import cuda
 
 
+def test_complex32_signature():
+    @cuda.jit
+    def kernel(value, out):
+        out[0] = value.real + value.imag
+
+    kernel.compile("void(complex32, float16[:])")
+
+
+def test_complex32_local_array_arithmetic():
+    @cuda.jit
+    def kernel(out):
+        values = cuda.local.array(2, dtype=types.complex32)
+        values[0] = types.complex32(1.5, -2.0)
+        values[1] = values[0] * values[0] + values[0]
+        out[0] = values[1].real
+        out[1] = values[1].imag
+
+    out = np.zeros(2, dtype=np.float16)
+    kernel[1, 1](out)
+
+    np.testing.assert_equal(out, np.array([-0.25, -8.0], dtype=np.float16))
+
+
 class TestAtomicOnComplexComponents(unittest.TestCase):
     def test_atomic_on_real_1d(self):
         @cuda.jit
