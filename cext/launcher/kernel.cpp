@@ -1679,6 +1679,7 @@ struct Grid {
 };
 
 bool try_clarify_invalid_value_error(const Grid& grid) {
+    // If we can't read the data we need to try to clarify, this is a no-op.
     CUdevice dev;
     if (g_cuCtxGetDevice(&dev) != CUDA_SUCCESS) return false;
 
@@ -1699,6 +1700,7 @@ bool try_clarify_invalid_value_error(const Grid& grid) {
 }
 
 bool try_clarify_launch_out_of_resources_error(CUkernel kernel, const Grid& block) {
+    // If we can't read the data we need to try to clarify, this is a no-op.
     CUfunction function;
     if (g_cuKernelGetFunction(&function, kernel) != CUDA_SUCCESS) return false;
 
