@@ -118,6 +118,28 @@ def test_shared_memory_complex_real_imag(complex_dtype, float_dtype):
     np.testing.assert_allclose(out_imag, inp.imag)
 
 
+def test_shared_memory_complex32_real_imag():
+    @cuda.jit
+    def kernel(inp_real, inp_imag, out_real, out_imag):
+        tid = cuda.threadIdx.x
+        sm = cuda.shared.array(N_SHARED, dtype=types.complex32)
+        sm[tid] = types.complex32(inp_real[tid], inp_imag[tid])
+        cuda.syncthreads()
+        out_real[tid] = sm.real[tid]
+        out_imag[tid] = sm.imag[tid]
+
+    rng = np.random.default_rng(42)
+    inp_real = rng.standard_normal(N_SHARED).astype(np.float16)
+    inp_imag = rng.standard_normal(N_SHARED).astype(np.float16)
+    out_real = np.zeros(N_SHARED, dtype=np.float16)
+    out_imag = np.zeros(N_SHARED, dtype=np.float16)
+
+    kernel[1, N_SHARED](inp_real, inp_imag, out_real, out_imag)
+
+    np.testing.assert_allclose(out_real, inp_real)
+    np.testing.assert_allclose(out_imag, inp_imag)
+
+
 @pytest.mark.parametrize(
     "complex_type",
     [
