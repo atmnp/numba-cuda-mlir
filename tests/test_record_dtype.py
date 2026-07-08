@@ -28,6 +28,8 @@ recordwithvaluestorage = np.dtype([("h", np.float16), ("flag", np.bool_)], align
 
 nestedrecordwitharray = np.dtype([("inner", [("a", np.float64), ("b", np.float64)], (1,))])
 
+nestedrecordwith2darray = np.dtype([("inner", [("a", np.float64), ("b", np.float64)], (2, 2))])
+
 nestedrecord = np.dtype([("inner", [("a", np.float64), ("b", np.float64)])])
 
 
@@ -275,6 +277,19 @@ class TestRecordFieldAccess:
         np.testing.assert_equal(result[0]["inner"][0]["b"], 22.0)
         np.testing.assert_equal(scalar_result[0]["inner"]["a"], 33.0)
         np.testing.assert_equal(scalar_result[0]["inner"]["b"], 44.0)
+
+    def test_read_tuple_indexed_nested_record_field(self):
+        @cuda.jit
+        def read_field(ary, out):
+            out[0] = ary[0]["inner"][0, 1]["a"]
+
+        arr = np.zeros(1, dtype=nestedrecordwith2darray)
+        arr[0]["inner"][0, 1]["a"] = 42.0
+        arr = cuda.to_device(arr)
+        out = cuda.to_device(np.zeros(1, dtype=np.float64))
+
+        read_field[1, 1](arr, out)
+        np.testing.assert_equal(out.copy_to_host()[0], 42.0)
 
 
 @pytest.mark.skip(reason="Causes memory errors")
