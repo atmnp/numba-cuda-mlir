@@ -27,6 +27,8 @@ TO_LLVM_DIALECT_PIPELINE = """
 def lower_to_llvm_dialect(cres):
     with mlir_context.get_context():
         module = ir.Module.parse(get_mlir_module_str(cres.metadata))
+        if cres.metadata.get("host_inline_helpers"):
+            PassManager.parse("builtin.module(inline)").run(module.operation)
         options = cres.metadata["targetoptions"]
         if options.get("dump_mlir") or options.get("dump"):
             print(f"=============== Host MLIR ===============\n\n{module}\n")

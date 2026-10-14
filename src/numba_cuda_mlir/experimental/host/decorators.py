@@ -28,6 +28,7 @@ def jit(func_or_sig=None, **options):
         "dump_numba_ir": False,
         "dump_mlir": False,
         "dump_llvm_dialect": False,
+        "inline": "never",
     }
     unknown = set(options).difference(targetoptions)
     if unknown:
@@ -35,7 +36,9 @@ def jit(func_or_sig=None, **options):
     targetoptions.update(options)
     if type(targetoptions["opt_level"]) is not int or not 0 <= targetoptions["opt_level"] <= 3:
         raise ValueError("opt_level must be an integer between 0 and 3")
-    for key in targetoptions.keys() - {"opt_level"}:
+    if targetoptions["inline"] not in ("never", "always") and not callable(targetoptions["inline"]):
+        raise ValueError("host.jit inline must be 'never', 'always', or a callable")
+    for key in targetoptions.keys() - {"opt_level", "inline"}:
         if not isinstance(targetoptions[key], bool):
             raise TypeError(f"{key} must be a boolean")
 

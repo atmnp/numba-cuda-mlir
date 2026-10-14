@@ -57,10 +57,18 @@ class ExecutionEngine:
 
         @ctypes.CFUNCTYPE(None, ctypes.c_int32)
         def report_error(code):
-            errors.code = code
+            if not getattr(errors, "code", 0):
+                errors.code = code
 
         self._report_error = report_error
         self.engine.register_runtime("host_scalar_error", report_error)
+
+        @ctypes.CFUNCTYPE(ctypes.c_int32)
+        def get_status():
+            return getattr(errors, "code", 0)
+
+        self._get_status = get_status
+        self.engine.register_runtime("host_scalar_status", get_status)
         self._packed_function = self.engine.lookup(symbol_name)
 
     def get_callable(self):

@@ -4,17 +4,22 @@
 from dataclasses import dataclass
 from typing import Any
 
-from numba_cuda_mlir.experimental.host.descriptor import target
+from numba_cuda_mlir import mlir_compiler
+from numba_cuda_mlir.experimental.host.descriptor import Dispatcher, target
 from numba_cuda_mlir.experimental.host.execution import scalar_ctype
 from numba_cuda_mlir.experimental.host.lowering import Lower
 from numba_cuda_mlir.experimental.host.optimization import lower_to_llvm_dialect
-from numba_cuda_mlir import mlir_compiler
 from numba_cuda_mlir.mlir_lowering import get_mlir_module_str
 from numba_cuda_mlir.numba_cuda import compiler, types, typing
 from numba_cuda_mlir.numba_cuda.core.compiler_lock import global_compiler_lock
-from numba_cuda_mlir.numba_cuda.core.errors import TypingError
 from numba_cuda_mlir.numba_cuda.core.compiler_machinery import register_pass
+from numba_cuda_mlir.numba_cuda.core.errors import TypingError
+from numba_cuda_mlir.numba_cuda.core.ir_utils import (
+    guard,
+    resolve_func_from_module,
+)
 from numba_cuda_mlir.numba_cuda.core.target_extension import target_override
+from numba_cuda_mlir.numba_cuda.core.untyped_passes import InlineInlinables
 from numba_cuda_mlir.numba_cuda.flags import CUDAFlags
 
 
@@ -26,6 +31,14 @@ class CompileResult:
     llvm_mlir: str
     entry_point: Any
     execution_engine: Any
+    metadata: dict[str, Any]
+
+
+@dataclass
+class LinkResult:
+    signature: typing.Signature
+    fndesc: Any
+    mlir: str
     metadata: dict[str, Any]
 
 
@@ -45,8 +58,42 @@ class Backend(mlir_compiler.MLIRBackend):
         return Lower(state.targetctx, fndesc, state.func_ir, state.metadata)
 
 
+@register_pass(mutates_CFG=True, analysis_only=False)
+class InlineHelpers(mlir_compiler.NumbaCudaMlirInlineInlinables):
+    _name = "host_inline_helpers"
+
+    def _do_work(self, state, work_list, block, i, expr, inline_worker):
+        definition = guard(state.func_ir.get_definition, expr.func)
+        helper = (
+            guard(resolve_func_from_module, state.func_ir, definition)
+            if getattr(definition, "op", None) == "getattr"
+            else getattr(definition, "value", None)
+        )
+        if isinstance(helper, Dispatcher):
+            # Typed MLIR inlining preserves helper boundary conversions and error exits.
+            return False
+        return super()._do_work(state, work_list, block, i, expr, inline_worker)
+
+
+def get_compiler_class(targetoptions):
+    base = mlir_compiler.get_compiler_class(targetoptions, backend_pass=Backend)
+
+    class Compiler(base):
+        def define_pipelines(self):
+            pipelines = super().define_pipelines()
+            for pipeline in pipelines:
+                pipeline.passes = [
+                    (InlineHelpers if issubclass(impl, InlineInlinables) else impl, desc)
+                    for impl, desc in pipeline.passes
+                ]
+                pipeline.finalize()
+            return pipelines
+
+    return Compiler
+
+
 @global_compiler_lock
-def compile_to_llvm_dialect(pyfunc, return_type, args, targetoptions):
+def compile_for_link(pyfunc, return_type, args, targetoptions, symbol_name=None):
     try:
         for arg in args:
             scalar_ctype(arg)
@@ -54,6 +101,9 @@ def compile_to_llvm_dialect(pyfunc, return_type, args, targetoptions):
             scalar_ctype(return_type)
     except TypeError as exc:
         raise TypingError(str(exc)) from exc
+    options = dict(targetoptions)
+    if symbol_name is not None:
+        options["_host_symbol_name"] = symbol_name
     typingctx = target.typing_context
     targetctx = target.target_context
     flags = CUDAFlags()
@@ -72,14 +122,22 @@ def compile_to_llvm_dialect(pyfunc, return_type, args, targetoptions):
             return_type=return_type,
             flags=flags,
             locals={},
-            pipeline_class=mlir_compiler.get_compiler_class(targetoptions, backend_pass=Backend),
+            pipeline_class=get_compiler_class(options),
         )
+    return LinkResult(
+        cres.signature, cres.fndesc, get_mlir_module_str(cres.metadata), cres.metadata
+    )
+
+
+@global_compiler_lock
+def compile_to_llvm_dialect(pyfunc, return_type, args, targetoptions):
+    cres = compile_for_link(pyfunc, return_type, args, targetoptions)
     return cres, lower_to_llvm_dialect(cres)
 
 
 @global_compiler_lock
-def compile(pyfunc, return_type, args, targetoptions):
-    cres, module = compile_to_llvm_dialect(pyfunc, return_type, args, targetoptions)
+def execute(cres, targetoptions):
+    module = lower_to_llvm_dialect(cres)
     from numba_cuda_mlir.experimental.host.execution import ExecutionEngine
 
     engine = ExecutionEngine(
@@ -94,3 +152,8 @@ def compile(pyfunc, return_type, args, targetoptions):
         execution_engine=engine,
         metadata=cres.metadata,
     )
+
+
+@global_compiler_lock
+def compile(pyfunc, return_type, args, targetoptions):
+    return execute(compile_for_link(pyfunc, return_type, args, targetoptions), targetoptions)

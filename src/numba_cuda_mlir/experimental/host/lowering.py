@@ -11,6 +11,8 @@ from numba_cuda_mlir.numba_cuda import types
 from numba_cuda_mlir.numba_cuda.core import ir as numba_ir
 from numba_cuda_mlir.numba_cuda.core.errors import TypingError
 from numba_cuda_mlir.tools import generate_mangled_name
+from numba_cuda_mlir.experimental.host.descriptor import Dispatcher
+from numba_cuda_mlir.numba_cuda.compiler import run_frontend
 
 
 class Lower(mlir_lowering.MLIRLower):
@@ -26,7 +28,9 @@ class Lower(mlir_lowering.MLIRLower):
             if isinstance(self.fndesc.restype, types.NoneType)
             else [self.get_return_type(self.fndesc.restype)]
         )
-        name = generate_mangled_name(self.fndesc.qualname, self.fndesc.argtypes)
+        name = generate_mangled_name(
+            self.targetoptions.get("_host_symbol_name", self.fndesc.qualname), self.fndesc.argtypes
+        )
         self.metadata["host_symbol_name"] = name
         with ir.InsertionPoint(self.mlir_module.body):
             self.mlir_funcOp = func.FuncOp(
@@ -58,7 +62,11 @@ class Lower(mlir_lowering.MLIRLower):
             func.call(
                 [],
                 callback.name.value,
-                [arith.constant(ir.IntegerType.get_signless(32), code)],
+                [
+                    arith.constant(ir.IntegerType.get_signless(32), code)
+                    if isinstance(code, int)
+                    else code
+                ],
             )
             results = self.mlir_funcOp.function_type.value.results
             func.ReturnOp(
@@ -153,17 +161,68 @@ class Lower(mlir_lowering.MLIRLower):
         typ = self.get_numba_type(target.name)
         # Module attributes identifying supported scalar constructors may be
         # resolved by shared lowering; scalar/custom attribute access is not.
-        if not isinstance(typ, types.NumberClass):
+        if not isinstance(typ, (types.NumberClass, types.Dispatcher)):
             raise TypingError(f"host.jit does not support attribute access {attr!r}")
         super().lower_getattr_assign(target, value, attr)
 
     def lower_call_expr_assign(self, target, fn, args, kws, expr=None):
+        typ = self.get_numba_type(fn.name)
+        if isinstance(typ, types.Dispatcher) and isinstance(typ.dispatcher, Dispatcher):
+            dispatcher = typ.dispatcher
+            signature = self.fndesc.calltypes[expr]
+            cres = dispatcher.compile_only(signature)
+            if cres.metadata.get("host_inline_helpers"):
+                self.metadata["host_inline_helpers"] = True
+            symbol = cres.metadata["host_symbol_name"]
+            existing = {
+                op.name.value: op for op in self.mlir_module.body if isinstance(op, func.FuncOp)
+            }
+            with self.mlir_module.context:
+                module = ir.Module.parse(cres.mlir)
+                for op in module.body:
+                    if not isinstance(op, func.FuncOp) or op.name.value in existing:
+                        continue
+                    cloned = op.clone()
+                    if len(op.body.blocks):
+                        cloned.attributes["sym_visibility"] = ir.StringAttr.get("private")
+                    self.mlir_module.body.append(cloned)
+                    existing[op.name.value] = cloned
+            callee = existing[symbol]
+            function_type = callee.function_type.value
+            operands = [
+                super(Lower, self).lower_cast(
+                    self.get_numba_type(arg.name), arg_type, self.load_var(arg)
+                )
+                for arg, arg_type in zip(args, signature.args, strict=True)
+            ]
+            result = func.CallOp(function_type.results, symbol, operands)
+            policy = dispatcher.targetoptions["inline"]
+            inline = policy == "always" or (
+                callable(policy) and policy(expr, self.func_ir, run_frontend(dispatcher.py_func))
+            )
+            if not inline:
+                result.attributes["no_inline"] = ir.UnitAttr.get()
+            else:
+                self.metadata["host_inline_helpers"] = True
+            status = get_or_insert_function(
+                "host_scalar_status",
+                ir.FunctionType.get([], [ir.IntegerType.get_signless(32)]),
+                self.mlir_module.operation,
+            )
+            status.attributes["llvm.emit_c_interface"] = ir.UnitAttr.get()
+            code = func.call([ir.IntegerType.get_signless(32)], status.name.value, [])
+            self._fail_if(
+                arith.cmpi(arith.CmpIPredicate.ne, code, arith.constant(code.type, 0)), code
+            )
+            with ir.InsertionPoint(self._host_active_block):
+                self.store_var(target, result.results[0] if result.results else None)
+            return
         value = self.load_var(fn)
         typ = self.get_numba_type(fn.name)
         if value not in (range, bool, int, float, abs) and not isinstance(typ, types.NumberClass):
             raise TypingError(
                 f"host.jit does not support calls to {getattr(value, '__qualname__', value)!r}; "
-                "only range and scalar constructors/abs are supported"
+                "only host.jit helpers, range, and scalar constructors/abs are supported"
             )
         if value not in (range, abs) and (kws or len(args) != 1):
             raise TypingError("host.jit scalar constructors require one positional argument")
