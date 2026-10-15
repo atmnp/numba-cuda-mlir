@@ -279,6 +279,10 @@ The following functions from the :mod:`operator` module are supported:
 * :func:`operator.truediv`
 * :func:`operator.xor`
 
+Unary negation (``-``) and bitwise inversion (``~``) of unsigned integers
+wrap at the input bit width before widening the result, matching NumPy and
+stock numba-cuda. For example, ``-uint8(1)`` is 255 and ``~uint8(0)`` is 255.
+
 .. _cuda_numpy_support:
 
 NumPy support
