@@ -139,6 +139,40 @@ def lower_get_size(
     builder.store_var(target, size)
 
 
+@lower_getattr(types.Array, "itemsize")
+def lower_get_itemsize(_, builder: MLIRLower, target, array):
+    array_type = builder.get_numba_type(array)
+    builder.store_var(target, index_of(storage_itemsize_bytes(array_type)))
+
+
+@lower_getattr(types.Array, "nbytes")
+def lower_get_nbytes(_, builder: MLIRLower, target, array):
+    itemsize = storage_itemsize_bytes(builder.get_numba_type(array))
+    array = builder.load_var(array)
+    dims = [memref.dim(array, index_of(i)) for i in range(array.type.rank)]
+    nbytes = functools.reduce(operator.mul, dims, index_of(itemsize))
+    builder.store_var(target, nbytes)
+
+
+@lower_getattr(types.Array, "T")
+def lower_get_transpose(_, builder: MLIRLower, target, array):
+    array = builder.load_var(array)
+    array_type = array.type
+    if array_type.rank <= 1:
+        builder.store_var(target, array)
+        return
+
+    strides, offset = array_type.get_strides_and_offset()
+    transposed_type = ir.MemRefType.get(
+        array_type.shape[::-1],
+        array_type.element_type,
+        layout=ir.StridedLayoutAttr.get(offset, strides[::-1]),
+        memory_space=array_type.memory_space,
+    )
+    permutation = ir.AffineMap.get_permutation(list(reversed(range(array_type.rank))))
+    builder.store_var(target, memref_dialect.transpose(transposed_type, array, permutation))
+
+
 def _lower_array_complex_real_imag(builder, target, array_var, attr):
     """Lower array.real / array.imag for complex arrays.
 
