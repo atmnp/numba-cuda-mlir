@@ -147,7 +147,11 @@ def lower_get_itemsize(_, builder: MLIRLower, target, array):
 
 @lower_getattr(types.Array, "nbytes")
 def lower_get_nbytes(_, builder: MLIRLower, target, array):
-    itemsize = storage_itemsize_bytes(builder.get_numba_type(array))
+    array_type = builder.get_numba_type(array)
+    itemsize = storage_itemsize_bytes(array_type)
+    if isinstance(array_type, types.NestedArray):
+        builder.store_var(target, index_of(array_type.nitems * itemsize))
+        return
     array = builder.load_var(array)
     dims = [memref.dim(array, index_of(i)) for i in range(array.type.rank)]
     nbytes = functools.reduce(operator.mul, dims, index_of(itemsize))
@@ -156,7 +160,18 @@ def lower_get_nbytes(_, builder: MLIRLower, target, array):
 
 @lower_getattr(types.Array, "T")
 def lower_get_transpose(_, builder: MLIRLower, target, array):
+    numba_type = builder.get_numba_type(array)
     array = builder.load_var(array)
+    if isinstance(numba_type, types.NestedArray):
+        if numba_type.ndim <= 1:
+            builder.store_var(target, array)
+        else:
+            itemsize = storage_itemsize_bytes(numba_type)
+            strides = [stride // itemsize for stride in numba_type.strides[::-1]]
+            desc = builder._build_memref_descriptor(array, numba_type.shape[::-1], strides)
+            result_type = builder.get_mlir_type(builder.get_numba_type(target))
+            builder.store_var(target, builtin.unrealized_conversion_cast([result_type], [desc]))
+        return
     array_type = array.type
     if array_type.rank <= 1:
         builder.store_var(target, array)
